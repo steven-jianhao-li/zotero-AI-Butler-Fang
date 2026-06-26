@@ -25,13 +25,14 @@
     "build": "zotero-plugin build && tsc --noEmit",
     "lint:check": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",
-    "release": "zotero-plugin release",
+    "release": "node ./scripts/release-fang.mjs",
     "pretest": "node ./scripts/gen-env-setup.mjs",
     "test": "zotero-plugin test --exit-on-finish",
     "pretest:watch": "node ./scripts/gen-env-setup.mjs",
     "test:watch": "zotero-plugin test",
     "scaffold:provider": "node ./scripts/create-provider.mjs",
-    "update-deps": "npm update --save"
+    "update-deps": "npm update --save",
+    "release:scaffold": "zotero-plugin release"
   },
   "dependencies": {
     "@types/marked": "^5.0.2",
