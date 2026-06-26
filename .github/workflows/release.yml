@@ -5,7 +5,6 @@ run-name: Release ${{ github.ref_name }}
 on:
   push:
     tags:
-      - "v*"
       - "Fang_v*"
   workflow_dispatch:
 
