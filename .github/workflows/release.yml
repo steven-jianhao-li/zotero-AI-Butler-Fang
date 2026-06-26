@@ -36,10 +36,36 @@ jobs:
         run: |
           npm run build
 
-      - name: Release to GitHub
+      - name: Verify release assets
         run: |
-          npm run release
-          sleep 1s
+          test "$(find .scaffold/build -maxdepth 1 -name '*.xpi' | wc -l)" -eq 1
+          test -f ".scaffold/build/update.json"
+
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          files: |
+            .scaffold/build/*.xpi
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Refresh update manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release
+          name: Release Manifest
+          body: |
+            This release is used to host `update.json`, please do not delete or modify it.
+
+            Updated for ${{ github.ref_name }}.
+          prerelease: true
+          make_latest: false
+          files: |
+            .scaffold/build/update.json
+            .scaffold/build/update-beta.json
+          fail_on_unmatched_files: true
+          overwrite_files: true
 
       - name: Notify release
         uses: apexskier/github-release-commenter@v1
