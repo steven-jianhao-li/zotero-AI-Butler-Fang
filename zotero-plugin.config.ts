@@ -4,12 +4,20 @@ import pkg from "./package.json";
 export default defineConfig({
   source: ["src", "addon"],
   dist: ".scaffold/build",
+  xpiName: "方班论文阅读神器",
   name: pkg.config.addonName,
   id: pkg.config.addonID,
   namespace: pkg.config.addonRef,
   updateURL: `https://github.com/{{owner}}/{{repo}}/releases/download/release/{{updateJson}}`,
   xpiDownloadLink:
-    "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
+    "https://github.com/{{owner}}/{{repo}}/releases/download/Fang_v{{version}}/{{xpiName}}.xpi",
+
+  release: {
+    bumpp: {
+      commit: "chore(publish): release Fang_v%s",
+      tag: "Fang_v%s",
+    },
+  },
 
   build: {
     assets: ["addon/**/*.*"],
