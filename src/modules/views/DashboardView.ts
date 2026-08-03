@@ -27,14 +27,11 @@ import { BaseView } from "./BaseView";
 import { TaskQueueManager, QueueStats, TaskStatus } from "../taskQueue";
 import { MainWindow } from "./MainWindow";
 import { AutoScanManager } from "../autoScanManager";
-import LLMClient from "../llmClient";
+import { getString } from "../../utils/locale";
 import { setPref } from "../../utils/prefs";
+import { showSetupWizard } from "./SetupWizard";
+import { openInteractiveOnboardingTour } from "../onboarding";
 import { createCard, createStyledButton } from "./ui/components";
-import {
-  setupPresets,
-  type SetupPreset,
-  type SetupPresetValues,
-} from "../setupPresets";
 
 /**
  * 管家状态枚举
@@ -108,9 +105,6 @@ export class DashboardView extends BaseView {
 
   /** 完成回调取消函数 */
   private unsubscribeComplete: (() => void) | null = null;
-
-  /** 当前选中的初始化预设 */
-  private selectedSetupPresetId: string = setupPresets[0]?.id || "";
 
   /**
    * 构造函数
@@ -238,7 +232,7 @@ export class DashboardView extends BaseView {
             borderBottom: "2px solid #59c0bc",
             paddingBottom: "10px",
           },
-          innerHTML: "📊 仪表盘",
+          innerHTML: getString("dashboard-title"),
         }),
       ],
     });
@@ -278,7 +272,7 @@ export class DashboardView extends BaseView {
         fontWeight: "700",
         marginBottom: "10px",
       },
-      textContent: "AI 管家正在休息",
+      textContent: getString("dashboard-status-idle"),
     });
 
     const statusDetail = this.createElement("div", {
@@ -287,7 +281,9 @@ export class DashboardView extends BaseView {
         fontSize: "14px",
         opacity: "0.9",
       },
-      textContent: "管家已为您总结 0 篇文献",
+      textContent: getString("dashboard-status-idle-detail", {
+        args: { count: 0 },
+      }),
     });
 
     card.appendChild(statusIcon);
@@ -312,12 +308,48 @@ export class DashboardView extends BaseView {
         gap: "15px",
       },
       children: [
-        this.createStatCard("total", "总处理数", "0", "#2196f3", "📚"),
-        this.createStatCard("today", "今日处理", "0", "#4caf50", "📅"),
-        this.createStatCard("pending", "待处理", "0", "#ff9800", "⏳"),
-        this.createStatCard("success-rate", "成功率", "100%", "#9c27b0", "✨"),
-        this.createStatCard("avg-time", "平均用时", "0s", "#607d8b", "⚡"),
-        this.createStatCard("failed", "失败数", "0", "#f44336", "❌"),
+        this.createStatCard(
+          "total",
+          getString("dashboard-stat-total"),
+          "0",
+          "#2196f3",
+          "📚",
+        ),
+        this.createStatCard(
+          "today",
+          getString("dashboard-stat-today"),
+          "0",
+          "#4caf50",
+          "📅",
+        ),
+        this.createStatCard(
+          "pending",
+          getString("dashboard-stat-pending"),
+          "0",
+          "#ff9800",
+          "⏳",
+        ),
+        this.createStatCard(
+          "success-rate",
+          getString("dashboard-stat-success-rate"),
+          "100%",
+          "#9c27b0",
+          "✨",
+        ),
+        this.createStatCard(
+          "avg-time",
+          getString("dashboard-stat-average-time"),
+          "0s",
+          "#607d8b",
+          "⚡",
+        ),
+        this.createStatCard(
+          "failed",
+          getString("dashboard-stat-failed"),
+          "0",
+          "#f44336",
+          "❌",
+        ),
       ],
     });
   }
@@ -363,7 +395,7 @@ export class DashboardView extends BaseView {
         fontSize: "16px",
         color: "var(--ai-text)",
       },
-      textContent: "⚡ 快捷操作",
+      textContent: getString("dashboard-quick-actions"),
     });
 
     const actionsGrid = this.createElement("div", {
@@ -375,14 +407,60 @@ export class DashboardView extends BaseView {
     });
 
     const actions = [
-      { icon: "🔍", label: "扫描未总结论文", color: "#2196f3" },
-      { icon: "📚", label: "扫描未精读论文", color: "#3f51b5" },
-      { icon: "🚀", label: "开始自动扫描", color: "#4caf50" },
-      { icon: "⏸️", label: "暂停自动扫描", color: "#ff9800" },
-      { icon: "📋", label: "查看任务队列", color: "#9c27b0" },
-      { icon: "🗑️", label: "清除已完成", color: "#9e9e9e" },
-      { icon: "⚙️", label: "打开设置", color: "#607d8b" },
-      { icon: "🧭", label: "一键初始化配置", color: "#00a67e" },
+      {
+        id: "scan-summary",
+        icon: "🔍",
+        label: getString("dashboard-action-scan-summary"),
+        color: "#2196f3",
+      },
+      {
+        id: "scan-deep-read",
+        icon: "📚",
+        label: getString("dashboard-action-scan-deep-read"),
+        color: "#3f51b5",
+      },
+      {
+        id: "start-auto-scan",
+        icon: "🚀",
+        label: getString("dashboard-action-start-auto-scan"),
+        color: "#4caf50",
+      },
+      {
+        id: "pause-auto-scan",
+        icon: "⏸️",
+        label: getString("dashboard-action-pause-auto-scan"),
+        color: "#ff9800",
+      },
+      {
+        id: "task-queue",
+        icon: "📋",
+        label: getString("dashboard-action-task-queue"),
+        color: "#9c27b0",
+      },
+      {
+        id: "clear-completed",
+        icon: "🗑️",
+        label: getString("dashboard-action-clear-completed"),
+        color: "#9e9e9e",
+      },
+      {
+        id: "open-settings",
+        icon: "⚙️",
+        label: getString("dashboard-action-open-settings"),
+        color: "#607d8b",
+      },
+      {
+        id: "setup",
+        icon: "🧭",
+        label: getString("dashboard-action-setup"),
+        color: "#00a67e",
+      },
+      {
+        id: "onboarding",
+        icon: "🎓",
+        label: getString("dashboard-action-onboarding"),
+        color: "#7952b3",
+      },
     ];
 
     actions.forEach((action) => {
@@ -392,8 +470,16 @@ export class DashboardView extends BaseView {
         "large",
       );
 
+      if (action.id === "setup") {
+        button.id = "ai-butler-quick-action-setup";
+      } else if (action.id === "task-queue") {
+        button.id = "ai-butler-quick-action-tasks";
+      } else if (action.id === "onboarding") {
+        button.id = "ai-butler-quick-action-onboarding";
+      }
+
       button.addEventListener("click", () => {
-        this.handleQuickAction(action.label);
+        this.handleQuickAction(action.id);
       });
 
       actionsGrid.appendChild(button);
@@ -424,7 +510,7 @@ export class DashboardView extends BaseView {
         fontSize: "16px",
         color: "var(--ai-text)",
       },
-      textContent: "🕒 最近活动",
+      textContent: getString("dashboard-recent-activities"),
     });
 
     const activityList = this.createElement("div", {
@@ -446,7 +532,7 @@ export class DashboardView extends BaseView {
           color: "#9e9e9e",
           fontSize: "14px",
         },
-        textContent: "暂无最近活动",
+        textContent: getString("dashboard-no-recent-activities"),
       });
       activityList.appendChild(emptyMsg);
     }
@@ -482,26 +568,37 @@ export class DashboardView extends BaseView {
     switch (status) {
       case ButlerStatus.WORKING:
         statusIcon.textContent = "🧐";
-        statusText.textContent = "AI 管家正在废寝忘食地工作";
+        statusText.textContent = getString("dashboard-status-working");
         statusDetail.textContent = currentItem
-          ? `正在阅读: ${currentItem}${remaining ? ` (还剩 ${remaining} 篇)` : ""}`
-          : "正在处理文献...";
+          ? getString("dashboard-status-reading", {
+              args: {
+                title: currentItem,
+                remaining: remaining
+                  ? getString("dashboard-status-remaining", {
+                      args: { count: remaining },
+                    })
+                  : "",
+              },
+            })
+          : getString("dashboard-status-processing");
         this.statusCard.style.background =
           "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)";
         break;
 
       case ButlerStatus.IDLE:
         statusIcon.textContent = "😴";
-        statusText.textContent = "AI 管家正在休息";
-        statusDetail.textContent = `管家已为您总结 ${this.stats.totalProcessed} 篇文献`;
+        statusText.textContent = getString("dashboard-status-idle");
+        statusDetail.textContent = getString("dashboard-status-idle-detail", {
+          args: { count: this.stats.totalProcessed },
+        });
         this.statusCard.style.background =
           "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
         break;
 
       case ButlerStatus.ERROR:
         statusIcon.textContent = "😵";
-        statusText.textContent = "AI 管家遇到了问题";
-        statusDetail.textContent = "请检查配置或查看错误日志";
+        statusText.textContent = getString("dashboard-status-error");
+        statusDetail.textContent = getString("dashboard-status-error-detail");
         this.statusCard.style.background =
           "linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%)";
         break;
@@ -581,7 +678,7 @@ export class DashboardView extends BaseView {
           color: "#9e9e9e",
           fontSize: "14px",
         },
-        textContent: "暂无最近活动",
+        textContent: getString("dashboard-no-recent-activities"),
       });
       activityList.appendChild(emptyMsg);
       return;
@@ -670,12 +767,21 @@ export class DashboardView extends BaseView {
     const now = new Date();
     const diff = Math.floor((now.getTime() - date.getTime()) / 1000);
 
-    if (diff < 60) return "刚刚";
-    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-    if (diff < 604800) return `${Math.floor(diff / 86400)} 天前`;
+    if (diff < 60) return getString("dashboard-time-now");
+    if (diff < 3600)
+      return getString("dashboard-time-minutes", {
+        args: { count: Math.floor(diff / 60) },
+      });
+    if (diff < 86400)
+      return getString("dashboard-time-hours", {
+        args: { count: Math.floor(diff / 3600) },
+      });
+    if (diff < 604800)
+      return getString("dashboard-time-days", {
+        args: { count: Math.floor(diff / 86400) },
+      });
 
-    return date.toLocaleDateString("zh-CN");
+    return date.toLocaleDateString();
   }
 
   /**
@@ -687,723 +793,77 @@ export class DashboardView extends BaseView {
     ztoolkit.log(`[AI Butler] 快捷操作: ${action}`);
 
     switch (action) {
-      case "一键初始化配置":
-        this.showDeepSeekSetupWizard();
+      case "setup":
+        showSetupWizard(this.container?.ownerDocument || undefined);
         break;
 
-      case "扫描未总结论文":
+      case "onboarding":
+        void openInteractiveOnboardingTour("dashboard");
+        break;
+
+      case "scan-summary":
         MainWindow.getInstance().openLibraryScanner("summary");
         break;
 
-      case "扫描未精读论文":
+      case "scan-deep-read":
         MainWindow.getInstance().openLibraryScanner("deepRead");
         break;
 
-      case "开始自动扫描":
+      case "start-auto-scan":
         setPref("autoScan", true);
         AutoScanManager.getInstance().start();
         new ztoolkit.ProgressWindow("AI Butler")
-          .createLine({ text: "✅ 已启动自动扫描", type: "success" })
+          .createLine({
+            text: getString("dashboard-auto-scan-started"),
+            type: "success",
+          })
           .show();
         break;
 
-      case "暂停自动扫描":
+      case "pause-auto-scan":
         setPref("autoScan", false);
         AutoScanManager.getInstance().stop();
         new ztoolkit.ProgressWindow("AI Butler")
-          .createLine({ text: "⏸️ 已暂停自动扫描", type: "default" })
+          .createLine({
+            text: getString("dashboard-auto-scan-paused"),
+            type: "default",
+          })
           .show();
         break;
 
-      case "查看任务队列":
+      case "task-queue":
         // 切换到任务队列标签页
         MainWindow.getInstance().switchTab("tasks");
         break;
 
-      case "清除已完成":
+      case "clear-completed":
         this.taskQueueManager.clearCompleted();
         new ztoolkit.ProgressWindow("AI Butler")
-          .createLine({ text: "🗑️ 已清除已完成任务", type: "success" })
+          .createLine({
+            text: getString("dashboard-completed-cleared"),
+            type: "success",
+          })
           .show();
         this.refreshData();
         break;
 
-      case "打开设置":
+      case "open-settings":
         // 切换到设置标签页
         MainWindow.getInstance().switchTab("settings");
         break;
 
       default:
         new ztoolkit.ProgressWindow("AI Butler")
-          .createLine({ text: `功能开发中: ${action}`, type: "default" })
+          .createLine({
+            text: getString("dashboard-feature-in-development", {
+              args: { action },
+            }),
+            type: "default",
+          })
           .show();
     }
   }
 
-  private showDeepSeekSetupWizard(): void {
-    const doc =
-      this.container?.ownerDocument || Zotero.getMainWindow().document;
-    const overlay = this.createElement(
-      "div",
-      {
-        styles: {
-          position: "fixed",
-          inset: "0",
-          zIndex: "2147483647",
-          backgroundColor: "rgba(0, 0, 0, 0.45)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "24px",
-        },
-      },
-      doc,
-    );
-
-    const modal = this.createElement(
-      "div",
-      {
-        styles: {
-          width: "min(760px, 96vw)",
-          maxHeight: "88vh",
-          overflow: "auto",
-          backgroundColor: "var(--ai-bg, #fff)",
-          color: "var(--ai-text, #222)",
-          borderRadius: "14px",
-          boxShadow: "0 18px 50px rgba(0,0,0,0.28)",
-          border: "1px solid rgba(89, 192, 188, 0.28)",
-        },
-      },
-      doc,
-    );
-
-    overlay.appendChild(modal);
-    const root = doc.body || doc.documentElement || this.container;
-    if (!root) return;
-    root.appendChild(overlay);
-
-    const close = () => overlay.remove();
-    overlay.addEventListener("click", (event) => {
-      if (event.target === overlay) close();
-    });
-
-    this.renderPresetSelectionStep(modal, close);
-  }
-
-  private renderPresetSelectionStep(
-    modal: HTMLElement,
-    close: () => void,
-  ): void {
-    modal.innerHTML = "";
-    const selectedPreset = this.getSelectedSetupPreset();
-    const nextButton = createStyledButton("下一步", "#00a67e", "medium");
-    nextButton.addEventListener("click", () =>
-      this.renderSetupPresetGuideStep(modal, close, selectedPreset),
-    );
-
-    const cancelButton = createStyledButton("取消", "#9e9e9e", "medium");
-    cancelButton.addEventListener("click", close);
-
-    modal.appendChild(
-      this.createWizardShell(
-        "🧭 一键初始化配置",
-        "选择一个适合新安装插件的预设，按教程填入 API Key 后即可自动完成常用设置。",
-        setupPresets.map((preset) => {
-          const card = this.createPresetCard(
-            preset,
-            preset.id === selectedPreset.id,
-          );
-          card.addEventListener("click", () => {
-            this.selectedSetupPresetId = preset.id;
-            this.renderPresetSelectionStep(modal, close);
-          });
-          return card;
-        }),
-        [cancelButton, nextButton],
-        close,
-      ),
-    );
-  }
-
-  private renderSetupPresetGuideStep(
-    modal: HTMLElement,
-    close: () => void,
-    preset: SetupPreset,
-  ): void {
-    modal.innerHTML = "";
-    const keyInput = this.createElement("input", {
-      attributes: {
-        type: "password",
-        placeholder: preset.apiKeyPlaceholder,
-        autocomplete: "off",
-      },
-      styles: {
-        width: "100%",
-        boxSizing: "border-box",
-        padding: "12px 14px",
-        border: "1px solid #cfd8dc",
-        borderRadius: "8px",
-        fontSize: "14px",
-        marginTop: "10px",
-      },
-    }) as HTMLInputElement;
-
-    const showKeyRow = this.createElement("label", {
-      styles: {
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        marginTop: "10px",
-        fontSize: "13px",
-        color: "var(--ai-text-muted, #666)",
-      },
-    });
-    const showKeyBox = this.createElement("input", {
-      attributes: { type: "checkbox" },
-    }) as HTMLInputElement;
-    showKeyBox.addEventListener("change", () => {
-      keyInput.type = showKeyBox.checked ? "text" : "password";
-    });
-    showKeyRow.appendChild(showKeyBox);
-    showKeyRow.appendChild(docText("显示密钥"));
-
-    const modelInput = this.createElement("input", {
-      attributes: {
-        type: "text",
-        placeholder: "先填写 API Key，再点击获取模型",
-      },
-      styles: {
-        flex: "1",
-        minWidth: "0",
-        padding: "10px 12px",
-        border: "1px solid #cfd8dc",
-        borderRadius: "8px",
-        fontSize: "14px",
-      },
-    }) as HTMLInputElement;
-    modelInput.value = preset.endpoint.model;
-    const modelStatus = this.createElement("div", {
-      textContent: "可手动填写模型，也可以用 API Key 获取模型列表后选择。",
-      styles: {
-        marginTop: "6px",
-        fontSize: "12px",
-        color: "var(--ai-text-muted, #666)",
-      },
-    });
-    const modelList = this.createElement("div", {
-      styles: {
-        display: "none",
-        marginTop: "8px",
-        border: "1px solid rgba(89, 192, 188, 0.25)",
-        borderRadius: "8px",
-        maxHeight: "180px",
-        overflow: "auto",
-      },
-    });
-    const fetchModelsButton = createStyledButton(
-      "获取模型",
-      "#3f51b5",
-      "small",
-    );
-    fetchModelsButton.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      await this.fetchSetupPresetModels(
-        preset,
-        keyInput.value.trim(),
-        modelInput,
-        modelStatus,
-        modelList,
-        fetchModelsButton,
-      );
-    });
-    const modelSection = this.createElement("div", {
-      styles: { display: "none", marginTop: "16px" },
-      children: [
-        this.createElement("div", {
-          textContent: "模型 *",
-          styles: {
-            marginBottom: "8px",
-            fontSize: "14px",
-            fontWeight: "700",
-          },
-        }),
-        this.createElement("div", {
-          styles: { display: "flex", gap: "8px", alignItems: "center" },
-          children: [modelInput, fetchModelsButton],
-        }),
-        modelStatus,
-        modelList,
-      ],
-    });
-
-    keyInput.addEventListener("input", () => {
-      modelSection.style.display = keyInput.value.trim() ? "block" : "none";
-    });
-
-    const content = this.createElement("div", {
-      children: [
-        this.createGuideList(preset.guideSteps),
-        keyInput,
-        showKeyRow,
-        modelSection,
-      ],
-    });
-
-    const backButton = createStyledButton("上一步", "#607d8b", "medium");
-    backButton.addEventListener("click", () =>
-      this.renderPresetSelectionStep(modal, close),
-    );
-    const nextButton = createStyledButton("下一步", "#00a67e", "medium");
-    nextButton.addEventListener("click", () => {
-      const apiKey = keyInput.value.trim();
-      if (!apiKey) {
-        keyInput.focus();
-        new ztoolkit.ProgressWindow("一键初始化配置", { closeTime: 2200 })
-          .createLine({ text: `请先填写 ${preset.name} API Key`, type: "fail" })
-          .show();
-        return;
-      }
-      this.renderSetupPresetConfirmStep(modal, close, preset, {
-        apiKey,
-        model: modelInput.value.trim() || preset.endpoint.model,
-      });
-    });
-
-    modal.appendChild(
-      this.createWizardShell(
-        preset.guideTitle,
-        preset.guideSubtitle,
-        [content],
-        [backButton, nextButton],
-        close,
-      ),
-    );
-
-    function docText(text: string): Text {
-      return Zotero.getMainWindow().document.createTextNode(text);
-    }
-  }
-
-  private renderSetupPresetConfirmStep(
-    modal: HTMLElement,
-    close: () => void,
-    preset: SetupPreset,
-    values: SetupPresetValues,
-  ): void {
-    modal.innerHTML = "";
-    const changes = preset.getChanges(values);
-    const list = this.createElement("div", {
-      styles: {
-        border: "1px solid rgba(89, 192, 188, 0.25)",
-        borderRadius: "10px",
-        overflow: "hidden",
-      },
-    });
-    list.appendChild(
-      this.createElement("div", {
-        styles: {
-          display: "grid",
-          gridTemplateColumns: "1.1fr 1fr 1fr",
-          gap: "10px",
-          padding: "10px 14px",
-          backgroundColor: "rgba(89, 192, 188, 0.08)",
-          borderBottom: "1px solid rgba(89, 192, 188, 0.2)",
-          fontSize: "12px",
-          fontWeight: "700",
-          color: "var(--ai-text-muted, #666)",
-        },
-        children: [
-          this.createElement("div", { textContent: "设置项" }),
-          this.createElement("div", { textContent: "当前设置" }),
-          this.createElement("div", { textContent: "将改为" }),
-        ],
-      }),
-    );
-
-    changes.forEach((change, index) => {
-      const row = this.createElement("div", {
-        styles: {
-          display: "grid",
-          gridTemplateColumns: "1.1fr 1fr 1fr",
-          gap: "10px",
-          padding: "12px 14px",
-          borderTop: "1px solid rgba(89, 192, 188, 0.18)",
-          fontSize: "13px",
-          alignItems: "center",
-        },
-      });
-      row.appendChild(
-        this.createElement("strong", { textContent: change.label }),
-      );
-      row.appendChild(this.createMutedCell(change.before));
-      row.appendChild(this.createElement("div", { textContent: change.after }));
-      list.appendChild(row);
-    });
-
-    const warning = this.createElement("div", {
-      textContent: `确认后会立即保存这些设置，并启动自动扫描。原有其它模型端点会保留在 ${preset.name} 后面。`,
-      styles: {
-        marginTop: "14px",
-        padding: "12px 14px",
-        backgroundColor: "rgba(255, 152, 0, 0.1)",
-        border: "1px solid rgba(255, 152, 0, 0.25)",
-        borderRadius: "8px",
-        color: "#8a5a00",
-        fontSize: "13px",
-        lineHeight: "1.5",
-      },
-    });
-
-    const backButton = createStyledButton("上一步", "#607d8b", "medium");
-    backButton.addEventListener("click", () =>
-      this.renderSetupPresetGuideStep(modal, close, preset),
-    );
-    const applyButton = createStyledButton("确认并应用", "#00a67e", "medium");
-    applyButton.addEventListener("click", () => {
-      preset.apply(values);
-      new ztoolkit.ProgressWindow("一键初始化配置", { closeTime: 3000 })
-        .createLine({ text: preset.successMessage, type: "success" })
-        .show();
-      close();
-    });
-
-    modal.appendChild(
-      this.createWizardShell(
-        "保存并应用配置",
-        `请检查即将修改的配置清单。确认后，插件会切换到 ${preset.name} 新手推荐配置。`,
-        [list, warning],
-        [backButton, applyButton],
-        close,
-      ),
-    );
-  }
-  private createWizardShell(
-    title: string,
-    subtitle: string,
-    content: HTMLElement[],
-    actions: HTMLButtonElement[],
-    close: () => void,
-  ): HTMLElement {
-    const shell = this.createElement("div", {
-      styles: {
-        padding: "24px",
-      },
-    });
-    const closeButton = createStyledButton("×", "#9e9e9e", "small");
-    Object.assign(closeButton.style, {
-      width: "34px",
-      height: "34px",
-      padding: "0",
-      fontSize: "20px",
-    });
-    closeButton.addEventListener("click", close);
-
-    const header = this.createElement("div", {
-      styles: {
-        position: "relative",
-        display: "flex",
-        justifyContent: "space-between",
-        gap: "16px",
-        alignItems: "flex-start",
-        marginBottom: "18px",
-      },
-      children: [
-        this.createElement("div", {
-          children: [
-            this.createElement("h2", {
-              textContent: title,
-              styles: {
-                margin: "0 0 8px 0",
-                color: "#00a67e",
-                fontSize: "22px",
-              },
-            }),
-            this.createElement("div", {
-              textContent: subtitle,
-              styles: {
-                color: "var(--ai-text-muted, #666)",
-                fontSize: "14px",
-                lineHeight: "1.6",
-              },
-            }),
-          ],
-        }),
-        closeButton,
-      ],
-    });
-
-    const body = this.createElement("div", {
-      styles: {
-        position: "relative",
-        display: "flex",
-        flexDirection: "column",
-        gap: "14px",
-      },
-      children: content,
-    });
-
-    const footer = this.createElement("div", {
-      styles: {
-        position: "relative",
-        display: "flex",
-        justifyContent: "flex-end",
-        gap: "10px",
-        marginTop: "22px",
-      },
-      children: actions,
-    });
-
-    shell.appendChild(header);
-    shell.appendChild(body);
-    shell.appendChild(footer);
-    return shell;
-  }
-
-  private createPresetCard(
-    preset: SetupPreset,
-    selected: boolean,
-  ): HTMLElement {
-    return this.createElement("div", {
-      styles: {
-        padding: "18px",
-        border: `${selected ? 2 : 1}px solid ${selected ? "#00a67e" : "rgba(89, 192, 188, 0.25)"}`,
-        borderRadius: "12px",
-        backgroundColor: selected
-          ? "rgba(0, 166, 126, 0.08)"
-          : "rgba(89, 192, 188, 0.04)",
-        cursor: "pointer",
-      },
-      children: [
-        this.createElement("div", {
-          textContent: `${selected ? "✅" : "○"} ${preset.title}`,
-          styles: {
-            fontSize: "18px",
-            fontWeight: "700",
-            marginBottom: "8px",
-          },
-        }),
-        this.createElement("div", {
-          textContent: preset.description,
-          styles: {
-            color: "var(--ai-text-muted, #666)",
-            fontSize: "14px",
-            lineHeight: "1.6",
-          },
-        }),
-      ],
-    });
-  }
-  private createGuideList(
-    items: Array<{ title: string; detail: string; url?: string }>,
-  ): HTMLElement {
-    const list = this.createElement("div", {
-      styles: {
-        position: "relative",
-        display: "flex",
-        flexDirection: "column",
-        gap: "10px",
-      },
-    });
-    items.forEach((item, index) => {
-      const row = this.createElement("div", {
-        styles: {
-          display: "grid",
-          gridTemplateColumns: "34px 1fr auto",
-          gap: "12px",
-          alignItems: "center",
-          padding: "12px",
-          border: "1px solid rgba(89, 192, 188, 0.2)",
-          borderRadius: "10px",
-        },
-      });
-      row.appendChild(
-        this.createElement("div", {
-          textContent: String(index + 1),
-          styles: {
-            width: "30px",
-            height: "30px",
-            borderRadius: "999px",
-            backgroundColor: "#00a67e",
-            color: "#fff",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontWeight: "700",
-          },
-        }),
-      );
-      row.appendChild(
-        this.createElement("div", {
-          children: [
-            this.createElement("div", {
-              textContent: item.title,
-              styles: { fontWeight: "700", marginBottom: "4px" },
-            }),
-            this.createElement("div", {
-              textContent: item.detail,
-              styles: {
-                fontSize: "13px",
-                color: "var(--ai-text-muted, #666)",
-                lineHeight: "1.5",
-              },
-            }),
-          ],
-        }),
-      );
-      if (item.url) {
-        const link = this.createElement("button", {
-          textContent: "打开",
-          styles: {
-            border: "none",
-            background: "transparent",
-            color: "#00a67e",
-            fontWeight: "700",
-            textDecoration: "none",
-            cursor: "pointer",
-            padding: "6px 8px",
-          },
-        });
-        link.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          this.openExternalUrl(item.url!);
-        });
-        row.appendChild(link);
-      } else {
-        row.appendChild(this.createElement("span"));
-      }
-      list.appendChild(row);
-    });
-    return list;
-  }
-
-  private openExternalUrl(url: string): void {
-    try {
-      if ((Zotero as any).launchURL) {
-        (Zotero as any).launchURL(url);
-        return;
-      }
-      const win = Zotero.getMainWindow() as any;
-      if (win?.ZoteroPane?.loadURI) {
-        win.ZoteroPane.loadURI(url);
-        return;
-      }
-      if (win?.openTrustedLinkIn) {
-        win.openTrustedLinkIn(url, "tab");
-        return;
-      }
-      win?.open?.(url, "_blank");
-    } catch (error) {
-      ztoolkit.log("[AI-Butler] 打开外部链接失败:", error);
-      new ztoolkit.ProgressWindow("一键初始化配置", { closeTime: 3000 })
-        .createLine({ text: `无法打开链接：${url}`, type: "fail" })
-        .show();
-    }
-  }
-
-  private async fetchSetupPresetModels(
-    preset: SetupPreset,
-    apiKey: string,
-    modelInput: HTMLInputElement,
-    status: HTMLElement,
-    modelList: HTMLElement,
-    button: HTMLButtonElement,
-  ): Promise<void> {
-    if (!apiKey) {
-      status.style.color = "#b71c1c";
-      status.textContent = `请先填写 ${preset.name} API Key`;
-      return;
-    }
-
-    const previousText = button.textContent || "获取模型";
-    button.disabled = true;
-    button.textContent = "获取中...";
-    button.style.opacity = "0.75";
-    status.style.color = "var(--ai-text-muted, #666)";
-    status.textContent = "正在获取模型列表...";
-    modelList.style.display = "none";
-
-    try {
-      const models = await LLMClient.listModels(preset.endpoint.providerType, {
-        apiUrl: preset.endpoint.apiUrl,
-        apiKey,
-        model: modelInput.value.trim() || preset.endpoint.model,
-        requestTimeoutMs: 30000,
-      });
-      if (models.length === 0) throw new Error("供应商未返回可用模型");
-
-      modelList.innerHTML = "";
-      models.forEach((model) => {
-        const item = this.createElement("button", {
-          textContent: this.formatSetupPresetModelLabel(model),
-          styles: {
-            width: "100%",
-            padding: "9px 12px",
-            border: "none",
-            borderBottom: "1px solid rgba(89, 192, 188, 0.12)",
-            background: "transparent",
-            color: "var(--ai-text, #222)",
-            cursor: "pointer",
-            textAlign: "left",
-            fontSize: "13px",
-          },
-        });
-        item.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          modelInput.value = model.id;
-          modelList.style.display = "none";
-          status.style.color = "#2e7d32";
-          status.textContent = `已选择模型：${model.id}`;
-        });
-        modelList.appendChild(item);
-      });
-      modelList.style.display = "block";
-      status.style.color = "#2e7d32";
-      status.textContent = `已获取 ${models.length} 个模型，请选择一个模型。`;
-    } catch (error: any) {
-      const message = error?.message || String(error);
-      status.style.color = "#b71c1c";
-      status.textContent = `获取失败：${message}`;
-      new ztoolkit.ProgressWindow("模型列表", { closeTime: 3500 })
-        .createLine({ text: `❌ ${message}`, type: "fail" })
-        .show();
-    } finally {
-      button.disabled = false;
-      button.textContent = previousText;
-      button.style.opacity = "1";
-    }
-  }
-
-  private formatSetupPresetModelLabel(model: {
-    id: string;
-    name?: string;
-    contextLength?: number;
-  }): string {
-    const parts = [model.id];
-    if (model.name && model.name !== model.id) parts.push(model.name);
-    if (model.contextLength)
-      parts.push(`${model.contextLength.toLocaleString()} ctx`);
-    return parts.join(" · ");
-  }
-  private createMutedCell(text: string): HTMLElement {
-    return this.createElement("div", {
-      textContent: text,
-      styles: {
-        color: "var(--ai-text-muted, #777)",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-      },
-    });
-  }
-
-  private getSelectedSetupPreset(): SetupPreset {
-    return (
-      setupPresets.find((preset) => preset.id === this.selectedSetupPresetId) ||
-      setupPresets[0]
-    );
-  }
   /**
    * 获取主窗口实例
    *
@@ -1597,14 +1057,27 @@ export class DashboardView extends BaseView {
       new ztoolkit.ProgressWindow("AI Butler", {
         closeTime: 3000,
       })
-        .createLine({ text: `✅ 已完成: ${task?.title}`, type: "success" })
+        .createLine({
+          text: getString("dashboard-task-completed", {
+            args: { title: task?.title || "" },
+          }),
+          type: "success",
+        })
         .show();
     } else {
       new ztoolkit.ProgressWindow("AI Butler", {
         closeTime: 5000,
       })
-        .createLine({ text: `❌ 处理失败: ${task?.title}`, type: "fail" })
-        .createLine({ text: error || "未知错误", type: "default" })
+        .createLine({
+          text: getString("dashboard-task-failed", {
+            args: { title: task?.title || "" },
+          }),
+          type: "fail",
+        })
+        .createLine({
+          text: error || getString("dashboard-unknown-error"),
+          type: "default",
+        })
         .show();
     }
   }

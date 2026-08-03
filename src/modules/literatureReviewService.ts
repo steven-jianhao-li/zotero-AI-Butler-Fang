@@ -16,8 +16,10 @@
  * @author AI-Butler Team
  */
 
+import { ContentExtractor } from "./contentExtractor";
 import { PDFExtractor } from "./pdfExtractor";
 import { NoteGenerator } from "./noteGenerator";
+import { zoteroNoteMathHtml } from "./noteMarkdown";
 import LLMService from "./llmService";
 import {
   LLMNoteMetadataService,
@@ -25,11 +27,12 @@ import {
 } from "./llmNoteMetadata";
 import type { LLMAbortSignal } from "./llmproviders/types";
 import { getPref } from "../utils/prefs";
+import { getString } from "../utils/locale";
 import { marked } from "marked";
 import {
-  DEFAULT_TABLE_TEMPLATE,
-  DEFAULT_TABLE_FILL_PROMPT,
-  DEFAULT_TABLE_REVIEW_PROMPT,
+  getConfiguredTableTemplate,
+  getConfiguredTableFillPrompt,
+  getConfiguredTableReviewPrompt,
 } from "../utils/prompts";
 
 /** 表格笔记管理策略类型 */
@@ -88,11 +91,10 @@ export class LiteratureReviewService {
     // 1. 逐篇填表阶段
     const tableTemplate =
       tableTemplateOverride ||
-      (getPref("tableTemplate" as any) as string) ||
-      DEFAULT_TABLE_TEMPLATE;
-    const fillPrompt =
-      (getPref("tableFillPrompt" as any) as string) ||
-      DEFAULT_TABLE_FILL_PROMPT;
+      getConfiguredTableTemplate(getPref("tableTemplate" as any) as string);
+    const fillPrompt = getConfiguredTableFillPrompt(
+      getPref("tableFillPrompt" as any) as string,
+    );
     const concurrency = (getPref("tableFillConcurrency" as any) as number) || 3;
 
     // 构建父条目 → PDF 附件的映射
@@ -110,7 +112,7 @@ export class LiteratureReviewService {
       }
     }
 
-    progressCallback?.("正在逐篇填表...", 10);
+    progressCallback?.(getString("literature-review-progress-fill-tables"), 10);
 
     const tableResults = await this.fillTablesInParallel(
       itemPdfPairs,
@@ -120,22 +122,31 @@ export class LiteratureReviewService {
       undefined,
       (done, total) => {
         const progress = 10 + Math.floor((done / total) * 50);
-        progressCallback?.(`正在填表 (${done}/${total})...`, progress);
+        progressCallback?.(
+          getString("literature-review-progress-fill-tables-count", {
+            args: { done, total },
+          }),
+          progress,
+        );
       },
       abortSignal,
     );
 
     // 2. 汇总表格并生成综述
-    progressCallback?.("正在汇总表格...", 65);
+    progressCallback?.(getString("literature-review-progress-aggregating"), 65);
 
     const aggregated = this.aggregateTableContents(tableResults, itemPdfPairs);
 
-    progressCallback?.("正在生成综述...", 70);
+    progressCallback?.(
+      getString("literature-review-progress-generating-review"),
+      70,
+    );
 
     const reviewPrompt =
       prompt ||
-      (getPref("tableReviewPrompt" as any) as string) ||
-      DEFAULT_TABLE_REVIEW_PROMPT;
+      getConfiguredTableReviewPrompt(
+        getPref("tableReviewPrompt" as any) as string,
+      );
     const fullPrompt = `${reviewPrompt}\n\n以下是各文献的结构化信息表格：\n\n${aggregated}`;
 
     const reviewResponse = await LLMService.generate({
@@ -152,7 +163,10 @@ export class LiteratureReviewService {
       itemPdfPairs,
     );
 
-    progressCallback?.("正在创建笔记...", 90);
+    progressCallback?.(
+      getString("literature-review-progress-creating-note"),
+      90,
+    );
 
     // 4. 创建独立笔记（直接放在分类目录下）
     const reviewNote = await this.createStandaloneReviewNote(
@@ -179,7 +193,7 @@ export class LiteratureReviewService {
       }
     }
 
-    progressCallback?.("完成!", 100);
+    progressCallback?.(getString("literature-review-progress-completed"), 100);
 
     return reviewNote;
   }
@@ -201,11 +215,10 @@ export class LiteratureReviewService {
   ): Promise<Zotero.Item> {
     const tableTemplate =
       tableTemplateOverride ||
-      (getPref("tableTemplate" as any) as string) ||
-      DEFAULT_TABLE_TEMPLATE;
-    const fillPrompt =
-      (getPref("tableFillPrompt" as any) as string) ||
-      DEFAULT_TABLE_FILL_PROMPT;
+      getConfiguredTableTemplate(getPref("tableTemplate" as any) as string);
+    const fillPrompt = getConfiguredTableFillPrompt(
+      getPref("tableFillPrompt" as any) as string,
+    );
     const concurrency = (getPref("tableFillConcurrency" as any) as number) || 3;
     const appendedTableEntries = Array.from(
       new Set(
@@ -231,7 +244,7 @@ export class LiteratureReviewService {
       }
     }
 
-    progressCallback?.("正在逐篇填表...", 10);
+    progressCallback?.(getString("literature-review-progress-fill-tables"), 10);
 
     const tableResults = forceMergeAppendedEntries
       ? await this.appendTableEntriesInParallel(
@@ -241,7 +254,12 @@ export class LiteratureReviewService {
           concurrency,
           (done, total) => {
             const progress = 10 + Math.floor((done / total) * 50);
-            progressCallback?.(`正在追加填表 (${done}/${total})...`, progress);
+            progressCallback?.(
+              getString("literature-review-progress-append-tables-count", {
+                args: { done, total },
+              }),
+              progress,
+            );
           },
           abortSignal,
         )
@@ -253,7 +271,12 @@ export class LiteratureReviewService {
           undefined,
           (done, total) => {
             const progress = 10 + Math.floor((done / total) * 50);
-            progressCallback?.(`正在填表 (${done}/${total})...`, progress);
+            progressCallback?.(
+              getString("literature-review-progress-fill-tables-count", {
+                args: { done, total },
+              }),
+              progress,
+            );
           },
           abortSignal,
         );
@@ -270,7 +293,7 @@ export class LiteratureReviewService {
       selectedTableEntries,
     );
 
-    progressCallback?.("正在汇总表格...", 65);
+    progressCallback?.(getString("literature-review-progress-aggregating"), 65);
     const aggregated = this.aggregateTableContents(
       filteredTableResults,
       itemPdfPairs,
@@ -283,7 +306,10 @@ export class LiteratureReviewService {
 
     const fullPrompt = `${questionPrompt}${selectedEntriesInstruction}\n\n以下是各文献的结构化信息表格：\n\n${aggregated}`;
 
-    progressCallback?.("正在回答问题...", 75);
+    progressCallback?.(
+      getString("literature-review-progress-answering-question"),
+      75,
+    );
     const answerResponse = await LLMService.generate({
       task: "literature-review",
       prompt: fullPrompt,
@@ -296,14 +322,17 @@ export class LiteratureReviewService {
       itemPdfPairs,
     );
 
-    progressCallback?.("正在创建笔记...", 90);
+    progressCallback?.(
+      getString("literature-review-progress-creating-note"),
+      90,
+    );
     const note = await this.createStandaloneReviewNote(
       collection,
       noteTitle,
       answerContent,
       LLMNoteMetadataService.fromResponse("literature-review", answerResponse),
     );
-    progressCallback?.("完成!", 100);
+    progressCallback?.(getString("literature-review-progress-completed"), 100);
     return note;
   }
 
@@ -385,10 +414,14 @@ export class LiteratureReviewService {
 
   private static buildTableTemplateFromEntries(entries: string[]): string {
     if (entries.length === 0) {
-      return DEFAULT_TABLE_TEMPLATE;
+      return getConfiguredTableTemplate();
     }
     const rows = entries.map((entry) => `| ${entry} | |`);
-    return ["| 维度 | 内容 |", "|------|------|", ...rows].join("\n");
+    return [
+      `| ${getString("literature-review-table-column-dimension")} | ${getString("literature-review-table-column-content")} |`,
+      "|------|------|",
+      ...rows,
+    ].join("\n");
   }
 
   private static buildAppendOnlyFillPrompt(
@@ -477,7 +510,9 @@ ${entryList}
           .split("\n")
           .map((line) => line.trim())
           .filter((line) => line.startsWith("|"));
-        const header = templateLines[0] || "| 维度 | 内容 |";
+        const header =
+          templateLines[0] ||
+          `| ${getString("literature-review-table-column-dimension")} | ${getString("literature-review-table-column-content")} |`;
         const separator =
           templateLines.find((line) =>
             this.isMarkdownSeparatorRow(this.parseMarkdownTableCells(line)),
@@ -561,7 +596,11 @@ ${entryList}
           );
           const fallback =
             (await this.findTableNote(task.parentItem)) ||
-            `(追加填表失败: ${error instanceof Error ? error.message : String(error)})`;
+            getString("literature-review-table-append-failed-inline", {
+              args: {
+                message: error instanceof Error ? error.message : String(error),
+              },
+            });
           results.set(task.parentItem.id, fallback);
         }
         completed++;
@@ -597,9 +636,16 @@ ${entryList}
     progressCallback?: (message: string, progress: number) => void,
     abortSignal?: LLMAbortSignal,
   ): Promise<string> {
-    const itemTitle = (item.getField("title") as string) || "未知标题";
+    const itemTitle =
+      (item.getField("title") as string) ||
+      getString("literature-review-unknown-title");
 
-    progressCallback?.(`正在提取 PDF: ${itemTitle.slice(0, 30)}...`, 10);
+    progressCallback?.(
+      getString("literature-review-progress-extracting-pdf-title", {
+        args: { title: itemTitle.slice(0, 30) },
+      }),
+      10,
+    );
 
     // 构建完整提示词：将 ${tableTemplate} 替换为实际模板
     const actualPrompt = fillPrompt.replace(
@@ -607,14 +653,19 @@ ${entryList}
       tableTemplate,
     );
 
-    progressCallback?.(`正在填表: ${itemTitle.slice(0, 30)}...`, 50);
+    progressCallback?.(
+      getString("literature-review-progress-filling-title", {
+        args: { title: itemTitle.slice(0, 30) },
+      }),
+      50,
+    );
 
     // 调用统一 LLM 中间件填表。输入策略由中间件统一读取并按 Provider 能力降级。
     const response = await LLMService.generate({
       task: "table",
       prompt: actualPrompt,
       content: {
-        kind: "pdf-attachment",
+        kind: "analyzable-attachment",
         item,
         attachment: pdfAttachment,
       },
@@ -629,9 +680,32 @@ ${entryList}
       LLMNoteMetadataService.fromResponse("table", response),
     );
 
-    progressCallback?.(`填表完成: ${itemTitle.slice(0, 30)}`, 100);
+    progressCallback?.(
+      getString("literature-review-progress-filled-title", {
+        args: { title: itemTitle.slice(0, 30) },
+      }),
+      100,
+    );
 
     return result;
+  }
+
+  static async fillTableForSingleAttachment(
+    item: Zotero.Item,
+    attachment: Zotero.Item,
+    tableTemplate: string,
+    fillPrompt: string,
+    progressCallback?: (message: string, progress: number) => void,
+    abortSignal?: LLMAbortSignal,
+  ): Promise<string> {
+    return this.fillTableForSinglePDF(
+      item,
+      attachment,
+      tableTemplate,
+      fillPrompt,
+      progressCallback,
+      abortSignal,
+    );
   }
 
   /**
@@ -731,10 +805,10 @@ ${entryList}
 
     // 创建新的填表笔记
     // 不使用 formatNoteContent，避免标题模式与 AI 笔记冲突
-    const itemTitle = ((item.getField("title") as string) || "未知").slice(
-      0,
-      60,
-    );
+    const itemTitle = (
+      (item.getField("title") as string) ||
+      getString("literature-review-unknown-value")
+    ).slice(0, 60);
 
     // 使用 marked 将 Markdown 表格转换为 HTML 表格（用于 Zotero 显示）
     marked.setOptions({ gfm: true, breaks: true });
@@ -743,17 +817,15 @@ ${entryList}
     renderedHtml = renderedHtml.replace(/\s+style="[^"]*"/g, "");
 
     // 将 LaTeX 公式转换为 Zotero 原生格式
-    // 块级公式: $$...$$ → <span class="math">$\displaystyle ...$</span>
     renderedHtml = renderedHtml.replace(
       /\$\$([\s\S]*?)\$\$/g,
-      (_match, formula) =>
-        `<span class="math">$\\displaystyle ${formula.trim()}$</span>`,
+      (_match, formula) => zoteroNoteMathHtml(formula.trim(), true),
     );
     // 行内公式: $...$ → <span class="math">$...$</span>
     // 使用负向前瞻/后瞻避免匹配已处理的 $$
     renderedHtml = renderedHtml.replace(
       /(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)/g,
-      (_match, formula) => `<span class="math">$${formula.trim()}$</span>`,
+      (_match, formula) => zoteroNoteMathHtml(formula.trim(), false),
     );
 
     // 将原始 Markdown 存储在预格式区块中，供 findTableNote 提取
@@ -764,10 +836,12 @@ ${entryList}
     const metadataBlock =
       metadata || this.lastTableMetadataByItemId.get(item.id) || null;
     const noteHtmlRaw =
-      `<h2>📊 文献表格 - ${itemTitle}</h2>` +
+      getString("literature-review-table-note-title", {
+        args: { title: itemTitle },
+      }) +
       `<div>${renderedHtml}</div>` +
       `<br/>` +
-      `<p style="color: gray; font-size: 12px;"><em>👇 以下为系统缓存的原始 Markdown 数据（用于追加填表，请勿修改）：</em></p>` +
+      `<p style="color: gray; font-size: 12px;"><em>${getString("literature-review-table-raw-cache-caption")}</em></p>` +
       `<pre data-ai-table-raw>${escapedRaw}</pre>`;
     const noteHtml = metadataBlock
       ? LLMNoteMetadataService.wrapHtml(noteHtmlRaw, metadataBlock)
@@ -847,21 +921,22 @@ ${entryList}
     // 辅助函数：提取作者姓氏
     const extractAuthorSurname = (item: Zotero.Item): string => {
       const creators = (item as any).getCreators?.() || [];
-      if (creators.length === 0) return "未知";
+      if (creators.length === 0)
+        return getString("literature-review-source-unknown");
       const c = creators[0];
       if (c.lastName) return c.lastName;
       if (c.name) {
         const nameParts = c.name.trim().split(/\s+/);
         return nameParts[nameParts.length - 1];
       }
-      return "未知";
+      return getString("literature-review-source-unknown");
     };
 
     // 辅助函数：提取年份
     const extractYear = (item: Zotero.Item): string => {
       const dateStr = (item.getField("date") as string) || "";
       const m = dateStr.match(/(\d{4})/);
-      return m ? m[1] : "未知";
+      return m ? m[1] : getString("literature-review-source-unknown");
     };
 
     let globalHeader = "";
@@ -880,9 +955,13 @@ ${entryList}
           0,
           80,
         );
-        label = `> **[${index}] 文献**: ${title} (${author}, ${year})`;
+        label = getString("literature-review-source-label", {
+          args: { index, title, author, year },
+        });
       } else {
-        label = `> **[${index}] 文献**`;
+        label = getString("literature-review-source-label-no-title", {
+          args: { index },
+        });
       }
 
       const { header, dataRows, nonTableContent } =
@@ -912,7 +991,7 @@ ${entryList}
     // 拼装：全局表头 + 所有文献数据
     let result = "";
     if (globalHeader) {
-      result += `**表格结构定义（以下每篇文献的数据行均遵循此表头）：**\n\n${globalHeader}\n\n---\n\n`;
+      result += `${getString("literature-review-table-structure-heading")}\n\n${globalHeader}\n\n---\n\n`;
     }
     result += parts.join("\n\n---\n\n");
 
@@ -984,7 +1063,11 @@ ${entryList}
           );
           results.set(
             task.parentItem.id,
-            `(填表失败: ${error instanceof Error ? error.message : String(error)})`,
+            getString("literature-review-table-fill-failed-inline", {
+              args: {
+                message: error instanceof Error ? error.message : String(error),
+              },
+            }),
           );
         }
         completed++;
@@ -1119,7 +1202,13 @@ ${entryList}
         (pdfAtt.getField("title") as string) || `PDF ${i + 1}`;
       const progress = 30 + Math.floor((i / total) * 20);
       progressCallback?.(
-        `正在提取 (${i + 1}/${total}): ${attachmentTitle.slice(0, 30)}...`,
+        getString("literature-review-progress-extracting-indexed", {
+          args: {
+            current: i + 1,
+            total,
+            title: attachmentTitle.slice(0, 30),
+          },
+        }),
         progress,
       );
 
@@ -1157,21 +1246,16 @@ ${entryList}
           displayTitle = `${paperTitle} - ${attachmentTitle}`;
         }
 
-        // 尝试读取 Base64 内容
-        let base64Content = "";
-        try {
-          const fileData = await IOUtils.read(filePath);
-          // 使用分块方式转换为 base64，避免大文件导致 "too many function arguments" 错误
-          base64Content = this.arrayBufferToBase64(fileData);
-        } catch (e) {
-          ztoolkit.log(`[AI-Butler] 读取 PDF 文件失败: ${filePath}`, e);
-        }
+        const isPdf = PDFExtractor.isPdfAttachment(pdfAtt);
+        const content = isPdf
+          ? this.arrayBufferToBase64(await IOUtils.read(filePath))
+          : await ContentExtractor.extractTextFromAnalyzableAttachment(pdfAtt);
 
         contents.push({
           title: displayTitle,
           filePath,
-          content: base64Content,
-          isBase64: true,
+          content,
+          isBase64: isPdf,
         });
       } catch (error) {
         ztoolkit.log(
@@ -1194,24 +1278,50 @@ ${entryList}
     progressCallback?: (message: string, progress: number) => void,
   ): Promise<string> {
     if (pdfContents.length === 0) {
-      throw new Error("没有可用的 PDF 内容");
+      throw new Error(getString("llm-error-no-pdf-content"));
     }
 
-    progressCallback?.("正在调用 AI 生成综述...", 60);
+    progressCallback?.(
+      getString("literature-review-progress-calling-ai-review"),
+      60,
+    );
 
-    const files = pdfContents.map((pdf, index) => ({
+    const pdfSources = pdfContents.filter((source) => source.isBase64);
+    const textSources = pdfContents.filter((source) => !source.isBase64);
+    const textSourceContent = textSources
+      .map((source) => "\n\n=== " + source.title + " ===\n" + source.content)
+      .join("\n");
+
+    if (pdfSources.length === 0) {
+      return LLMService.generateText({
+        task: "literature-review",
+        prompt,
+        content: {
+          kind: "text",
+          text: textSourceContent,
+          policy: "text",
+        },
+      });
+    }
+
+    const files = pdfSources.map((pdf, index) => ({
       filePath: pdf.filePath,
-      displayName: `${index + 1}_${pdf.title.slice(0, 50)}`,
-      base64Content: pdf.isBase64 ? pdf.content : undefined,
-      textContent: pdf.isBase64 ? undefined : pdf.content,
+      displayName: index + 1 + "_" + pdf.title.slice(0, 50),
+      base64Content: pdf.content,
     }));
+
+    const fullPrompt =
+      textSources.length > 0
+        ? prompt + "\n\n以下是额外的文本内容源：" + textSourceContent
+        : prompt;
 
     return LLMService.generateText({
       task: "literature-review",
-      prompt,
+      prompt: fullPrompt,
       content: {
         kind: "pdf-files",
         files,
+        policy: "pdf-base64",
       },
     });
   }
@@ -1224,7 +1334,10 @@ ${entryList}
     prompt: string,
     progressCallback?: (message: string, progress: number) => void,
   ): Promise<string> {
-    progressCallback?.("正在上传 PDF 文件到大模型...", 55);
+    progressCallback?.(
+      getString("literature-review-progress-uploading-pdf"),
+      55,
+    );
 
     const files = pdfContents.map((pdf, index) => ({
       filePath: pdf.filePath,
@@ -1233,7 +1346,10 @@ ${entryList}
       textContent: pdf.isBase64 ? undefined : pdf.content,
     }));
 
-    progressCallback?.("正在调用 AI 生成综述...", 65);
+    progressCallback?.(
+      getString("literature-review-progress-calling-ai-review"),
+      65,
+    );
 
     const result = await LLMService.generateText({
       task: "literature-review",
@@ -1252,7 +1368,10 @@ ${entryList}
     prompt: string,
     progressCallback?: (message: string, progress: number) => void,
   ): Promise<string> {
-    progressCallback?.("正在调用 AI 生成综述 (文本模式)...", 60);
+    progressCallback?.(
+      getString("literature-review-progress-calling-ai-review-text"),
+      60,
+    );
 
     // 如果有 Base64 内容但 provider 不支持多文件，尝试提取文本
     let combinedContent = "";
@@ -1290,7 +1409,9 @@ ${entryList}
 
     // 纯文本模式
     if (!combinedContent.trim()) {
-      throw new Error("当前 API 不支持多文件处理，且无法提取 PDF 文本内容");
+      throw new Error(
+        getString("literature-review-error-multifile-and-text-unavailable"),
+      );
     }
 
     const fullPrompt = `${prompt}\n\n以下是需要综述的论文内容:\n${combinedContent}`;

@@ -44,8 +44,15 @@ declare namespace _ZoteroTypes {
       "stream": boolean;
       "enablePromptCacheOptimization": boolean;
       "requestTimeout": string;
+      "autoContinuationRounds": string;
       "mineruApiKey": string;
       "mineruModelVersion": string;
+      "mineruSaveMarkdown": boolean;
+      "mineruSaveAsAttachment": boolean;
+      "mineruSyncExternal": boolean;
+      "mineruExternalPath": string;
+      "mineruFileNameMode": string;
+      "promptLanguage": string;
       "summaryPrompt": string;
       "customPrompts": string;
       "summaryMode": string;
@@ -64,6 +71,7 @@ declare namespace _ZoteroTypes {
       "scanInterval": string;
       "pdfProcessMode": string;
       "pdfAttachmentMode": string;
+      "autoDownloadMissingPdf": boolean;
       "imageSummaryCustomHeaders": string;
       "imageSummaryRequestTimeoutSeconds": string;
       "imageSummaryAspectRatioEnabled": boolean;
@@ -85,6 +93,7 @@ declare namespace _ZoteroTypes {
       "sidebarModuleOrder": string;
       "sidebarNoteCollapsed": boolean;
       "sidebarImageCollapsed": boolean;
+      "quickChatSuppressNewConversationWarning": boolean;
       "notePrefix": string;
       "noteStrategy": string;
       "noteExportEnabled": boolean;
@@ -96,6 +105,7 @@ declare namespace _ZoteroTypes {
       "noteExportSuppressDirectoryPrompt": boolean;
       "mindmapPrompt": string;
       "mindmapExportPath": string;
+      "onboardingTutorialSeenVersion": string;
     };
   }
 }

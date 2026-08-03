@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ================================================================
  * 条目面板侧边栏区块模块
  * ================================================================
@@ -14,7 +14,6 @@ import { config } from "../../package.json";
 import { getString, getLocaleID } from "../utils/locale";
 import { getPref, setPref } from "../utils/prefs";
 import {
-  getSidebarModuleOrder,
   isTableFeatureEnabled,
   isSidebarModuleEnabled,
   type SidebarModuleId,
@@ -31,10 +30,24 @@ import {
   type ChatAbortControllerLike,
 } from "./chatContext";
 import {
+  buildQuickChatQuestionWithRelatedContext,
+  createQuickChatRelatedContextSignature,
+  getQuickChatRelatedLimit,
+  resolveQuickChatRelatedContext,
+  validateQuickChatRelatedSelection,
+  type QuickChatRelatedContextResult,
+  type QuickChatRelatedItemRef,
+  type QuickChatRelatedMode,
+} from "./quickChatRelatedContext";
+import { openQuickChatRelatedSelectorDialog } from "./quickChatRelatedSelector";
+import {
   addZoteroNoteOverflowGuards,
   buildFollowUpChatPairNoteHtml,
   decodeMathHtmlEntities,
   normalizeFollowUpChatNoteHtml,
+  normalizeLatexForKatex,
+  requiresDisplayMath,
+  stripMathDelimiters,
 } from "./noteMarkdown";
 import { AiNoteService, type AiNoteKind } from "./aiNoteService";
 import { SummaryView } from "./views/SummaryView";
@@ -48,6 +61,10 @@ interface ChatState {
   itemId: number | null;
   pdfContent: string;
   isBase64: boolean;
+  relatedItems: QuickChatRelatedItemRef[];
+  relatedMode: QuickChatRelatedMode;
+  relatedContextSignature: string;
+  relatedContextIncludedCount: number;
   conversationHistory: Array<{
     role: "system" | "user" | "assistant";
     content: string;
@@ -60,12 +77,12 @@ interface ChatState {
 // 递增的对话对 ID 计数器
 let quickChatPairIdCounter = 0;
 
-/**
- * 内联公式转块级公式的阈值（渲染后HTML字符数）
- * 当内联公式渲染后的HTML长度超过此阈值时，自动转换为可滚动的块级公式
- * 调整此值可控制何时触发转换，详见 doc/DevelopmentGuide.md
- */
-const INLINE_FORMULA_TO_BLOCK_THRESHOLD = 2000;
+function getSidebarNoteKindLabel(noteKind: AiNoteKind): string {
+  return noteKind === "summary"
+    ? getString("itempane-note-kind-summary")
+    : getString("itempane-note-kind-deep-read");
+}
+
 const SIDEBAR_HEADING_TO_BLOCKQUOTE_TEXT_THRESHOLD = 36;
 const SIDEBAR_NOTE_OVERFLOW_GUARD_CSS = `
 .ai-butler-note-section,
@@ -75,12 +92,19 @@ const SIDEBAR_NOTE_OVERFLOW_GUARD_CSS = `
   box-sizing: border-box;
 }
 .ai-butler-note-section,
+.ai-butler-note-page,
 .ai-butler-note-content-wrapper,
 .ai-butler-note-content {
+  inline-size: 100%;
+  min-inline-size: 0;
+  max-inline-size: 100%;
   min-width: 0;
   max-width: 100%;
+  contain: inline-size;
 }
-.ai-butler-note-content,
+.ai-butler-note-content {
+  overflow-x: hidden !important;
+}
 .ai-butler-note-content p,
 .ai-butler-note-content li,
 .ai-butler-note-content blockquote,
@@ -92,6 +116,8 @@ const SIDEBAR_NOTE_OVERFLOW_GUARD_CSS = `
 .ai-butler-note-content h6,
 .ai-butler-note-content td,
 .ai-butler-note-content th {
+  min-width: 0;
+  max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -103,19 +129,65 @@ const SIDEBAR_NOTE_OVERFLOW_GUARD_CSS = `
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-.ai-butler-note-content pre,
-.ai-butler-note-content table,
-.ai-butler-note-content .katex-display,
-.ai-butler-note-content .katex-scroll-container {
-  max-width: 100%;
+.ai-butler-note-content pre {
   overflow-x: auto;
   overflow-y: hidden;
 }
 .ai-butler-note-content table {
-  display: block;
-  width: max-content;
+  display: table;
+  inline-size: 100%;
+  width: 100%;
+  max-inline-size: 100%;
   max-width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
+  overflow-wrap: anywhere;
+}
+.ai-butler-note-content th,
+.ai-butler-note-content td {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
+}
+.ai-butler-note-content .katex-scroll-container,
+.ai-butler-note-content .katex-display {
+  display: block !important;
+  inline-size: 100% !important;
+  width: 100% !important;
+  min-inline-size: 0 !important;
+  min-width: 0 !important;
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  overscroll-behavior-inline: contain;
+  contain: inline-size;
+}
+.ai-butler-note-content .katex-display {
+  margin: 0.65em 0;
+  padding-bottom: 0.15em;
+  text-align: left;
+}
+.ai-butler-note-content .katex-scroll-container > .katex-display {
+  margin: 0;
+}
+.ai-butler-note-content .katex-display > .katex,
+.ai-butler-note-content .katex-scroll-container .katex {
+  display: inline-block !important;
+  max-width: none !important;
+  white-space: nowrap !important;
+}
+.ai-butler-note-content .katex-inline {
+  display: inline-block;
+  min-inline-size: 0;
+  min-width: 0;
+  max-inline-size: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: middle;
 }
 .ai-butler-note-content img,
 .ai-butler-note-content svg,
@@ -131,6 +203,10 @@ let currentChatState: ChatState = {
   itemId: null,
   pdfContent: "",
   isBase64: false,
+  relatedItems: [],
+  relatedMode: "summary",
+  relatedContextSignature: "",
+  relatedContextIncludedCount: 0,
   conversationHistory: [],
   isChatting: false,
   abortController: null,
@@ -138,11 +214,7 @@ let currentChatState: ChatState = {
 };
 
 type SidebarAutoRefreshTarget =
-  | "summary"
-  | "deepRead"
-  | "imageSummary"
-  | "mindmap"
-  | "table";
+  "summary" | "deepRead" | "imageSummary" | "mindmap" | "table";
 
 let sidebarContext: {
   doc: Document;
@@ -179,7 +251,53 @@ let sidebarNoteEditState: SidebarNoteEditState | null = null;
 const pendingSidebarRefreshTargets = new Set<SidebarAutoRefreshTarget>();
 const quickChatToggleListeners = new WeakMap<HTMLElement, EventListener>();
 const sidebarNoteEditEventCleanups = new WeakMap<HTMLElement, () => void>();
+const sidebarWorkspaceResizeObservers = new WeakMap<
+  HTMLElement,
+  ResizeObserver
+>();
+const sidebarWorkspaceMenuCleanups = new WeakMap<HTMLElement, () => void>();
 const SIDEBAR_SUMMARY_SELECTION_PREF = "sidebarSelectedSummaryBlockIds" as any;
+
+type SidebarTabId = "summary" | "chat" | "deepRead" | "quickRead";
+
+type SidebarTabDefinition = {
+  id: SidebarTabId;
+  labelKey: string;
+  icon: string;
+  isAvailable: () => boolean;
+};
+
+const SIDEBAR_TAB_DEFINITIONS: SidebarTabDefinition[] = [
+  {
+    id: "summary",
+    labelKey: "itempane-tab-summary",
+    icon: "✦",
+    isAvailable: () => isSidebarModuleEnabled("note"),
+  },
+  {
+    id: "chat",
+    labelKey: "itempane-tab-chat",
+    icon: "◌",
+    isAvailable: () =>
+      isSidebarModuleEnabled("actionButtons") ||
+      isSidebarModuleEnabled("quickChat"),
+  },
+  {
+    id: "deepRead",
+    labelKey: "itempane-tab-deep-read",
+    icon: "◇",
+    isAvailable: () => isSidebarModuleEnabled("deepRead"),
+  },
+  {
+    id: "quickRead",
+    labelKey: "itempane-tab-quick-read",
+    icon: "⌁",
+    isAvailable: () =>
+      isSidebarModuleEnabled("table") ||
+      isSidebarModuleEnabled("mindmap") ||
+      isSidebarModuleEnabled("imageSummary"),
+  },
+];
 
 function setSidebarContext(doc: Document, item: Zotero.Item | null): void {
   sidebarContext = item
@@ -578,7 +696,10 @@ async function runSidebarRefresh(): Promise<void> {
 
   let item: Zotero.Item = sidebarContext.item;
   try {
-    item = await Zotero.Items.getAsync(itemId);
+    const refreshedItem = await Zotero.Items.getAsync(itemId);
+    if (refreshedItem) {
+      item = refreshedItem;
+    }
   } catch {
     // ignore and use cached item instance
   }
@@ -593,12 +714,12 @@ async function runSidebarRefresh(): Promise<void> {
       if (isSidebarNoteEditing(itemId)) {
         setSidebarNoteEditStatus(
           doc,
-          "编辑中，已跳过自动刷新。",
+          getString("itempane-note-editing-skip-auto-refresh"),
           undefined,
           "summary",
         );
       } else {
-        noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+        noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
         await loadNoteContent(doc, item, noteContent, "summary");
       }
     }
@@ -612,12 +733,12 @@ async function runSidebarRefresh(): Promise<void> {
       if (isSidebarNoteEditing(itemId)) {
         setSidebarNoteEditStatus(
           doc,
-          "编辑中，已跳过自动刷新。",
+          getString("itempane-note-editing-skip-auto-refresh"),
           undefined,
           "deepRead",
         );
       } else {
-        noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+        noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
         await loadNoteContent(doc, item, noteContent, "deepRead");
       }
     }
@@ -631,7 +752,7 @@ async function runSidebarRefresh(): Promise<void> {
       "ai-butler-image-btn-container",
     ) as HTMLElement | null;
     if (imageContainer && imageBtnContainer) {
-      imageContainer.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+      imageContainer.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
       await loadImageSummary(doc, item, imageContainer, imageBtnContainer);
     }
   }
@@ -641,7 +762,7 @@ async function runSidebarRefresh(): Promise<void> {
       "ai-butler-mindmap-container",
     ) as HTMLElement | null;
     if (mindmapContainer) {
-      mindmapContainer.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+      mindmapContainer.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
       await loadMindmapContent(doc, item, mindmapContainer);
     }
   }
@@ -651,7 +772,7 @@ async function runSidebarRefresh(): Promise<void> {
       "ai-butler-table-content",
     ) as HTMLElement | null;
     if (tableContent) {
-      tableContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+      tableContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
       await loadTableContent(item, tableContent);
     }
   }
@@ -693,13 +814,13 @@ export function registerItemPaneSection(
       paneID: "ai-butler-chat-section",
       pluginID: pluginID,
       header: {
-        l10nID: getLocaleID("itempane-ai-section-header" as any),
-        label: "AI 管家",
+        l10nID: getLocaleID("itempane-ai-section-header"),
+        label: getString("aibutler-itempane-ai-section-header"),
         icon: rootURI + "icons/icon24.png",
       },
       sidenav: {
-        l10nID: getLocaleID("itempane-ai-section-sidenav" as any),
-        tooltiptext: "AI 管家",
+        l10nID: getLocaleID("itempane-ai-section-sidenav"),
+        tooltiptext: getString("aibutler-itempane-ai-section-sidenav"),
         icon: rootURI + "icons/icon24.png",
       },
       onRender: ({ body, item, editable, tabType }: any) => {
@@ -725,7 +846,7 @@ export async function refreshCurrentItemPaneSection(): Promise<void> {
     if (doc) {
       setSidebarNoteEditStatus(
         doc,
-        "编辑中，请先保存或取消。",
+        getString("itempane-note-editing-save-or-cancel"),
         undefined,
         sidebarNoteEditState.noteKind,
       );
@@ -741,7 +862,10 @@ export async function refreshCurrentItemPaneSection(): Promise<void> {
 
   let item = sidebarRenderContext.item;
   try {
-    item = await Zotero.Items.getAsync(itemId);
+    const refreshedItem = await Zotero.Items.getAsync(itemId);
+    if (refreshedItem) {
+      item = refreshedItem;
+    }
   } catch {
     // 使用缓存的 item 继续刷新
   }
@@ -758,6 +882,7 @@ function renderItemPaneSection(
   item: Zotero.Item,
   handleOpenAIChat: (itemId: number) => Promise<void>,
 ): void {
+  cleanupSidebarWorkspace(body);
   body.innerHTML = "";
   const doc = body.ownerDocument;
 
@@ -767,14 +892,18 @@ function renderItemPaneSection(
     return;
   }
 
-  // 容器样式
+  ensureSidebarWorkspaceStyles(doc);
+
   body.style.cssText = `
-    padding: 10px;
-    font-family: system-ui, -apple-system, sans-serif;
+    padding: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 13px;
     width: 100%;
     max-width: 100%;
-    overflow-x: auto;
+    min-width: 0;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
     box-sizing: border-box;
   `;
 
@@ -784,12 +913,7 @@ function renderItemPaneSection(
     sidebarRenderContext = null;
     sidebarNoteEditState = null;
     const hint = doc.createElement("div");
-    hint.style.cssText = `
-      color: #9e9e9e;
-      font-size: 12px;
-      text-align: center;
-      padding: 12px;
-    `;
+    hint.className = "ai-butler-sidebar-empty";
     hint.textContent = getString("itempane-ai-no-item");
     body.appendChild(hint);
     return;
@@ -809,11 +933,17 @@ function renderItemPaneSection(
 
   // 重置聊天状态（如果切换了条目）
   if (currentChatState.itemId !== item.id) {
-    currentChatState.abortController?.abort("快速追问条目已切换");
+    currentChatState.abortController?.abort(
+      getString("itempane-quick-chat-abort-item-switched"),
+    );
     currentChatState = {
       itemId: item.id,
       pdfContent: "",
       isBase64: false,
+      relatedItems: [],
+      relatedMode: "summary",
+      relatedContextSignature: "",
+      relatedContextIncludedCount: 0,
       conversationHistory: [],
       isChatting: false,
       abortController: null,
@@ -821,23 +951,799 @@ function renderItemPaneSection(
     };
   }
 
-  // 按用户配置的顺序渲染侧边栏功能区块
-  const renderers: Record<SidebarModuleId, () => void> = {
-    actionButtons: () => renderActionButtons(body, doc, item, handleOpenAIChat),
-    note: () => renderNoteSection(body, doc, item, "summary"),
-    deepRead: () => renderNoteSection(body, doc, item, "deepRead"),
-    table: () => renderTableSection(body, doc, item),
-    imageSummary: () => renderImageSummarySection(body, doc, item),
-    mindmap: () => renderMindmapSection(body, doc, item),
-    quickChat: () =>
-      renderChatArea(body, doc, item, !isSidebarModuleEnabled("actionButtons")),
+  const tabs = getAvailableSidebarTabs();
+  if (tabs.length === 0) {
+    const hint = doc.createElement("div");
+    hint.className = "ai-butler-sidebar-empty";
+    hint.textContent = getString("itempane-no-enabled-tabs");
+    body.appendChild(hint);
+    return;
+  }
+
+  const shell = doc.createElement("div");
+  shell.className = "ai-butler-sidebar-shell";
+
+  const header = doc.createElement("div");
+  header.className = "ai-butler-sidebar-topbar";
+
+  const titleWrap = doc.createElement("div");
+  titleWrap.className = "ai-butler-sidebar-title-wrap";
+
+  const eyebrow = doc.createElement("div");
+  eyebrow.className = "ai-butler-sidebar-eyebrow";
+  eyebrow.textContent = getString("aibutler-itempane-ai-section-header");
+
+  const itemTitle = doc.createElement("div");
+  itemTitle.className = "ai-butler-sidebar-item-title";
+  itemTitle.textContent = getSidebarItemTitle(item);
+  itemTitle.title = getSidebarItemTitle(item);
+
+  titleWrap.appendChild(eyebrow);
+  titleWrap.appendChild(itemTitle);
+
+  const refreshBtn = doc.createElement("button");
+  refreshBtn.type = "button";
+  refreshBtn.className =
+    "ai-butler-sidebar-icon-button ai-butler-sidebar-refresh";
+  refreshBtn.title = getString("itempane-refresh-tooltip");
+  refreshBtn.textContent = "↻";
+  refreshBtn.addEventListener("click", async () => {
+    refreshBtn.textContent = "…";
+    refreshBtn.disabled = true;
+    try {
+      await refreshCurrentItemPaneSection();
+    } catch (err: any) {
+      ztoolkit.log("[AI-Butler] 重新渲染侧边栏失败:", err);
+    } finally {
+      refreshBtn.textContent = "↻";
+      refreshBtn.disabled = false;
+    }
+  });
+
+  header.appendChild(titleWrap);
+  header.appendChild(refreshBtn);
+
+  const nav = doc.createElement("div");
+  nav.className = "ai-butler-sidebar-tabs";
+  nav.setAttribute("role", "tablist");
+
+  const tabButtons = new Map<SidebarTabId, HTMLButtonElement>();
+  const panels = new Map<SidebarTabId, HTMLElement>();
+  const overflowMenuItems = new Map<SidebarTabId, HTMLButtonElement>();
+
+  const moreWrap = doc.createElement("div");
+  moreWrap.className = "ai-butler-sidebar-more-wrap";
+
+  const moreBtn = doc.createElement("button");
+  moreBtn.type = "button";
+  moreBtn.className = "ai-butler-sidebar-tab ai-butler-sidebar-more";
+  moreBtn.setAttribute("aria-haspopup", "menu");
+  moreBtn.setAttribute("aria-expanded", "false");
+  moreBtn.textContent = "…";
+
+  const moreMenu = doc.createElement("div");
+  moreMenu.className = "ai-butler-sidebar-more-menu";
+  moreMenu.setAttribute("role", "menu");
+  moreMenu.style.display = "none";
+
+  moreWrap.appendChild(moreBtn);
+  moreWrap.appendChild(moreMenu);
+
+  const content = doc.createElement("div");
+  content.className = "ai-butler-sidebar-content";
+
+  const preferredActiveTab = String(
+    (getPref("sidebarActiveTab" as any) as string) || "",
+  ) as SidebarTabId;
+  let activeTab = tabs.some((tab) => tab.id === preferredActiveTab)
+    ? preferredActiveTab
+    : tabs[0].id;
+
+  const activateTab = (tabId: SidebarTabId): void => {
+    if (!panels.has(tabId)) return;
+    activeTab = tabId;
+    setPref("sidebarActiveTab" as any, activeTab as any);
+
+    for (const tab of tabs) {
+      const isActive = tab.id === activeTab;
+      const button = tabButtons.get(tab.id);
+      const menuItem = overflowMenuItems.get(tab.id);
+      const panel = panels.get(tab.id);
+
+      if (button) {
+        button.classList.toggle("is-active", isActive);
+        button.setAttribute("aria-selected", isActive ? "true" : "false");
+      }
+      if (menuItem) {
+        menuItem.classList.toggle("is-active", isActive);
+      }
+      if (panel) {
+        panel.style.display = isActive ? "flex" : "none";
+        panel.setAttribute("aria-hidden", isActive ? "false" : "true");
+      }
+    }
+    applySidebarTabOverflow(nav, tabs, tabButtons, overflowMenuItems, moreWrap);
   };
 
-  for (const moduleId of getSidebarModuleOrder()) {
-    if (isSidebarModuleEnabled(moduleId)) {
-      renderers[moduleId]();
+  for (const tab of tabs) {
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.className = "ai-butler-sidebar-tab";
+    button.dataset.tabId = tab.id;
+    button.setAttribute("role", "tab");
+    button.setAttribute(
+      "aria-selected",
+      tab.id === activeTab ? "true" : "false",
+    );
+    button.title = getSidebarTabLabel(tab);
+    button.innerHTML = `<span class="ai-butler-sidebar-tab-label">${escapeHtmlForChat(getSidebarTabLabel(tab))}</span>`;
+    button.addEventListener("click", () => activateTab(tab.id));
+    tabButtons.set(tab.id, button);
+    nav.appendChild(button);
+
+    const menuItem = doc.createElement("button");
+    menuItem.type = "button";
+    menuItem.className = "ai-butler-sidebar-more-item";
+    menuItem.setAttribute("role", "menuitem");
+    menuItem.textContent = `${tab.icon} ${getSidebarTabLabel(tab)}`;
+    menuItem.addEventListener("click", () => {
+      moreMenu.style.display = "none";
+      moreBtn.setAttribute("aria-expanded", "false");
+      activateTab(tab.id);
+    });
+    overflowMenuItems.set(tab.id, menuItem);
+    moreMenu.appendChild(menuItem);
+  }
+
+  nav.appendChild(moreWrap);
+
+  moreBtn.addEventListener("click", (event: Event) => {
+    event.stopPropagation();
+    const willOpen = moreMenu.style.display === "none";
+    moreMenu.style.display = willOpen ? "block" : "none";
+    moreBtn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+  });
+
+  const closeMenu = (event: Event): void => {
+    if (moreWrap.contains(event.target as Node)) return;
+    moreMenu.style.display = "none";
+    moreBtn.setAttribute("aria-expanded", "false");
+  };
+  doc.addEventListener("click", closeMenu);
+
+  const relayoutSidebar = (): void => {
+    fitSidebarShellToViewport(body, shell);
+    applySidebarTabOverflow(nav, tabs, tabButtons, overflowMenuItems, moreWrap);
+  };
+  doc.defaultView?.addEventListener("resize", relayoutSidebar);
+  doc.defaultView?.top?.addEventListener("resize", relayoutSidebar);
+  sidebarWorkspaceMenuCleanups.set(body, () => {
+    doc.removeEventListener("click", closeMenu);
+    doc.defaultView?.removeEventListener("resize", relayoutSidebar);
+    doc.defaultView?.top?.removeEventListener("resize", relayoutSidebar);
+  });
+
+  for (const tab of tabs) {
+    const panel = doc.createElement("div");
+    panel.className = "ai-butler-sidebar-tab-panel";
+    panel.dataset.tabId = tab.id;
+    panel.setAttribute("role", "tabpanel");
+    panel.style.display = tab.id === activeTab ? "flex" : "none";
+    panel.setAttribute("aria-hidden", tab.id === activeTab ? "false" : "true");
+    panels.set(tab.id, panel);
+    content.appendChild(panel);
+    renderSidebarTabPanel(tab.id, panel, doc, item, handleOpenAIChat);
+  }
+
+  nav.appendChild(refreshBtn);
+  shell.appendChild(nav);
+  shell.appendChild(content);
+  body.appendChild(shell);
+  bindSidebarWheelTrap(shell);
+
+  activateTab(activeTab);
+
+  const ResizeObserverCtor = doc.defaultView?.ResizeObserver;
+  if (ResizeObserverCtor) {
+    const observer = new ResizeObserverCtor(relayoutSidebar);
+    observer.observe(nav);
+    observer.observe(body);
+    if (body.parentElement) observer.observe(body.parentElement);
+    sidebarWorkspaceResizeObservers.set(body, observer);
+  }
+
+  doc.defaultView?.setTimeout(relayoutSidebar, 0);
+}
+
+function fitSidebarShellToViewport(
+  body: HTMLElement,
+  shell: HTMLElement,
+): void {
+  const doc = body.ownerDocument;
+  if (!doc) return;
+  const view = doc.defaultView;
+  if (!view) return;
+
+  const ownHeight = view.innerHeight || 0;
+  const topHeight = view.top?.innerHeight || 0;
+  const viewportHeight = Math.max(ownHeight, topHeight, 360);
+  const rect = body.getBoundingClientRect();
+  const bottomInset = 8;
+  const available = Math.floor(viewportHeight - rect.top - bottomInset);
+  const targetHeight = Math.max(320, available);
+
+  body.style.height = `${targetHeight}px`;
+  body.style.minHeight = `${targetHeight}px`;
+  shell.style.height = `${targetHeight}px`;
+  shell.style.minHeight = `${targetHeight}px`;
+  shell.style.maxHeight = `${targetHeight}px`;
+}
+
+function bindSidebarWheelTrap(shell: HTMLElement): void {
+  shell.addEventListener(
+    "wheel",
+    (event: WheelEvent) => {
+      const target = event.target as HTMLElement | null;
+      const scrollTarget = findSidebarWheelTarget(shell, target, event.deltaY);
+      if (scrollTarget) {
+        // Let the browser perform native scrolling to avoid scrollbar jitter,
+        // while preventing the event from reaching Zotero's outer item pane.
+        event.stopPropagation();
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    { passive: false },
+  );
+}
+
+function findSidebarWheelTarget(
+  shell: HTMLElement,
+  target: HTMLElement | null,
+  deltaY: number,
+): HTMLElement | null {
+  let node: HTMLElement | null = target;
+  while (node && node !== shell) {
+    if (canElementScrollVertically(node, deltaY)) {
+      return node;
+    }
+    node = node.parentElement as HTMLElement | null;
+  }
+
+  const activePanel = shell.querySelector(
+    '.ai-butler-sidebar-tab-panel[aria-hidden="false"]',
+  ) as HTMLElement | null;
+  const candidates = [
+    activePanel?.querySelector(".ai-butler-note-content-wrapper"),
+    activePanel?.querySelector(".ai-butler-quick-chat-messages"),
+    activePanel,
+    shell.querySelector(".ai-butler-sidebar-content"),
+  ];
+
+  for (const candidate of candidates) {
+    const element = candidate as HTMLElement | null;
+    if (element && canElementScrollVertically(element, deltaY)) {
+      return element;
     }
   }
+  return null;
+}
+
+function canElementScrollVertically(
+  element: HTMLElement,
+  deltaY: number,
+): boolean {
+  if (element.scrollHeight <= element.clientHeight + 1) return false;
+  if (deltaY < 0) return element.scrollTop > 0;
+  if (deltaY > 0) {
+    return element.scrollTop + element.clientHeight < element.scrollHeight - 1;
+  }
+  return true;
+}
+
+function cleanupSidebarWorkspace(body: HTMLElement): void {
+  const previousObserver = sidebarWorkspaceResizeObservers.get(body);
+  if (previousObserver) {
+    previousObserver.disconnect();
+    sidebarWorkspaceResizeObservers.delete(body);
+  }
+
+  const previousMenuCleanup = sidebarWorkspaceMenuCleanups.get(body);
+  if (previousMenuCleanup) {
+    previousMenuCleanup();
+    sidebarWorkspaceMenuCleanups.delete(body);
+  }
+
+  const previousQuickChatToggleListener = quickChatToggleListeners.get(body);
+  if (previousQuickChatToggleListener) {
+    body.removeEventListener(
+      "ai-butler-toggle-inline-chat",
+      previousQuickChatToggleListener,
+    );
+    quickChatToggleListeners.delete(body);
+  }
+}
+
+function ensureSidebarWorkspaceStyles(doc: Document): void {
+  if (doc.getElementById("ai-butler-sidebar-workspace-styles")) return;
+
+  const style = doc.createElement("style");
+  style.id = "ai-butler-sidebar-workspace-styles";
+  style.textContent = `
+    .ai-butler-sidebar-shell,
+    .ai-butler-sidebar-shell * {
+      box-sizing: border-box;
+    }
+
+    .ai-butler-sidebar-shell {
+      --ai-butler-accent: #59c0bc;
+      --ai-butler-border: rgba(88, 166, 205, 0.16);
+      --ai-butler-soft-border: rgba(88, 166, 205, 0.1);
+      --ai-butler-muted: rgba(96, 108, 122, 0.72);
+      --ai-butler-surface: rgba(255, 255, 255, 0.78);
+      --ai-butler-surface-strong: rgba(242, 249, 253, 0.86);
+      --ai-butler-blue-bg: #f8fcff;
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+      overscroll-behavior: contain;
+      border: 1px solid rgba(91, 174, 216, 0.16);
+      border-bottom-color: rgba(128, 128, 128, 0.12);
+      border-radius: 14px 14px 0 0;
+      background:
+        linear-gradient(180deg, rgba(240, 249, 255, 0.82), rgba(250, 253, 255, 0.78) 82px, rgba(255, 255, 255, 0.62)),
+        var(--ai-butler-blue-bg);
+      color: inherit;
+    }
+
+    .ai-butler-sidebar-topbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 10px 10px 8px;
+      border-bottom: 1px solid var(--ai-butler-soft-border);
+      flex: 0 0 auto;
+    }
+
+    .ai-butler-sidebar-title-wrap {
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .ai-butler-sidebar-eyebrow {
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1.2;
+      letter-spacing: 0.01em;
+    }
+
+    .ai-butler-sidebar-item-title {
+      margin-top: 2px;
+      color: var(--ai-butler-muted);
+      font-size: 11px;
+      line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .ai-butler-sidebar-icon-button {
+      width: 28px;
+      height: 28px;
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--ai-butler-border);
+      border-radius: 9px;
+      background: rgba(128, 128, 128, 0.045);
+      color: inherit;
+      cursor: pointer;
+      font-size: 15px;
+      line-height: 1;
+      transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+    }
+
+    .ai-butler-sidebar-icon-button:hover {
+      background: rgba(89, 192, 188, 0.12);
+      border-color: rgba(89, 192, 188, 0.42);
+    }
+
+    .ai-butler-sidebar-icon-button:disabled {
+      cursor: wait;
+      opacity: 0.6;
+    }
+
+    .ai-butler-sidebar-refresh {
+      margin-left: auto;
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .ai-butler-sidebar-tabs {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+      width: 100%;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(91, 174, 216, 0.12);
+      border-radius: 14px 14px 0 0;
+      background: rgba(247, 252, 255, 0.82);
+      overflow: visible;
+      flex: 0 0 auto;
+    }
+
+    .ai-butler-sidebar-tab {
+      min-width: max-content;
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 30px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      white-space: nowrap;
+      transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+    }
+
+    .ai-butler-sidebar-tab:hover,
+    .ai-butler-sidebar-tab.is-active {
+      background: rgba(89, 192, 188, 0.13);
+      border-color: rgba(89, 192, 188, 0.38);
+    }
+
+    .ai-butler-sidebar-tab.is-active {
+      color: var(--ai-butler-accent);
+      box-shadow: inset 0 0 0 1px rgba(89, 192, 188, 0.1);
+    }
+
+    .ai-butler-sidebar-tab-icon {
+      flex: 0 0 auto;
+      font-size: 11px;
+      opacity: 0.9;
+    }
+
+    .ai-butler-sidebar-tab-label {
+      min-width: max-content;
+      overflow: visible;
+      text-overflow: clip;
+    }
+
+    .ai-butler-sidebar-more-wrap {
+      position: relative;
+      display: none;
+      flex: 0 0 auto;
+      margin-left: 0;
+    }
+
+    .ai-butler-sidebar-more-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      z-index: 20;
+      min-width: 116px;
+      padding: 5px;
+      border: 1px solid var(--ai-butler-border);
+      border-radius: 10px;
+      background: rgba(250, 250, 250, 0.98);
+      color: #1f2933;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+    }
+
+    .ai-butler-sidebar-more-item {
+      width: 100%;
+      display: none;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 9px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      text-align: left;
+      font: inherit;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .ai-butler-sidebar-more-item:hover,
+    .ai-butler-sidebar-more-item.is-active {
+      background: rgba(89, 192, 188, 0.13);
+    }
+
+    .ai-butler-sidebar-content {
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
+      overscroll-behavior: contain;
+      padding: 0;
+      scrollbar-width: thin;
+    }
+
+    .ai-butler-sidebar-tab-panel {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      flex-direction: column;
+      overflow: hidden;
+      overscroll-behavior: contain;
+      padding: 10px;
+    }
+
+    .ai-butler-sidebar-tab-panel > :first-child {
+      margin-top: 0 !important;
+    }
+
+    .ai-butler-sidebar-tab-panel > :last-child {
+      margin-bottom: 0 !important;
+    }
+
+    .ai-butler-sidebar-tab-panel[data-tab-id="chat"],
+    .ai-butler-sidebar-tab-panel[data-tab-id="quickRead"] {
+      overflow-y: auto;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+    }
+
+    .ai-butler-sidebar-tab-panel[data-tab-id="summary"],
+    .ai-butler-sidebar-tab-panel[data-tab-id="deepRead"] {
+      padding: 0;
+    }
+
+    .ai-butler-sidebar-chat-entry {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+      margin-bottom: 10px;
+      padding: 10px;
+      border: 1px solid var(--ai-butler-border);
+      border-radius: 10px;
+      background: var(--ai-butler-surface);
+    }
+
+    .ai-butler-sidebar-chat-entry-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--ai-butler-muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .ai-butler-sidebar-empty {
+      min-height: 180px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      color: rgba(128, 128, 128, 0.85);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 260px) {
+      .ai-butler-sidebar-tab {
+        padding: 0 10px;
+      }
+      .ai-butler-sidebar-item-title {
+        display: none;
+      }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .ai-butler-sidebar-shell {
+        --ai-butler-accent: #71d7d2;
+        --ai-butler-border: rgba(112, 184, 214, 0.2);
+        --ai-butler-soft-border: rgba(112, 184, 214, 0.14);
+        --ai-butler-muted: rgba(203, 213, 225, 0.64);
+        --ai-butler-surface: rgba(15, 23, 42, 0.42);
+        --ai-butler-surface-strong: rgba(20, 34, 48, 0.62);
+        --ai-butler-blue-bg: #111820;
+        border-color: rgba(112, 184, 214, 0.18);
+        border-bottom-color: rgba(148, 163, 184, 0.12);
+        background:
+          linear-gradient(180deg, rgba(17, 33, 45, 0.72), rgba(15, 23, 42, 0.58) 86px, rgba(15, 23, 42, 0.38)),
+          var(--ai-butler-blue-bg);
+      }
+
+      .ai-butler-sidebar-tabs {
+        border-bottom-color: rgba(112, 184, 214, 0.14);
+        background: rgba(17, 31, 42, 0.78);
+      }
+
+      .ai-butler-sidebar-icon-button,
+      .ai-butler-sidebar-refresh {
+        background: rgba(15, 23, 42, 0.55);
+        border-color: rgba(148, 163, 184, 0.22);
+      }
+
+      .ai-butler-sidebar-more-menu {
+        background: rgba(24, 31, 39, 0.98);
+        color: #f3f4f6;
+      }
+    }
+  `;
+  const styleHost = doc.head || doc.documentElement;
+  if (styleHost) styleHost.appendChild(style);
+}
+
+function getAvailableSidebarTabs(): SidebarTabDefinition[] {
+  return SIDEBAR_TAB_DEFINITIONS.filter((tab) => tab.isAvailable());
+}
+
+function getSidebarTabLabel(tab: SidebarTabDefinition): string {
+  return getString(tab.labelKey);
+}
+
+function getSidebarItemTitle(item: Zotero.Item): string {
+  const title = String((item as any).getField?.("title") || "").trim();
+  return title || getString("summary-untitled-paper");
+}
+
+function applySidebarTabOverflow(
+  nav: HTMLElement,
+  tabs: SidebarTabDefinition[],
+  tabButtons: Map<SidebarTabId, HTMLButtonElement>,
+  overflowMenuItems: Map<SidebarTabId, HTMLButtonElement>,
+  moreWrap: HTMLElement,
+): void {
+  const visibleTabs = new Set<SidebarTabId>(tabs.map((tab) => tab.id));
+  const activeTab = tabs.find((tab) =>
+    tabButtons.get(tab.id)?.classList.contains("is-active"),
+  )?.id;
+
+  for (const tab of tabs) {
+    const button = tabButtons.get(tab.id);
+    const menuItem = overflowMenuItems.get(tab.id);
+    if (button) button.style.display = "inline-flex";
+    if (menuItem) menuItem.style.display = "none";
+  }
+  moreWrap.style.display = "none";
+
+  const fits = (): boolean => nav.scrollWidth <= nav.clientWidth + 1;
+  if (fits()) return;
+
+  moreWrap.style.display = "block";
+  const hidePriority: SidebarTabId[] = [
+    "deepRead",
+    "chat",
+    "summary",
+    "quickRead",
+  ];
+  const orderedTabs = hidePriority
+    .map((id) => tabs.find((tab) => tab.id === id))
+    .filter((tab): tab is SidebarTabDefinition => !!tab);
+
+  for (const tab of orderedTabs) {
+    if (fits()) break;
+    if (tab.id === activeTab && visibleTabs.size > 1) continue;
+    if (tab.id === "quickRead" && visibleTabs.size > 2) continue;
+    const button = tabButtons.get(tab.id);
+    const menuItem = overflowMenuItems.get(tab.id);
+    if (!button || !menuItem) continue;
+    button.style.display = "none";
+    menuItem.style.display = "flex";
+    visibleTabs.delete(tab.id);
+  }
+
+  if (!fits() && activeTab) {
+    for (const tab of orderedTabs) {
+      if (tab.id === activeTab) continue;
+      const button = tabButtons.get(tab.id);
+      const menuItem = overflowMenuItems.get(tab.id);
+      if (!button || button.style.display === "none") continue;
+      button.style.display = "none";
+      menuItem?.style.setProperty("display", "flex");
+      visibleTabs.delete(tab.id);
+      if (fits()) break;
+    }
+  }
+
+  const hasHiddenTabs = visibleTabs.size < tabs.length;
+  moreWrap.style.display = hasHiddenTabs ? "block" : "none";
+}
+
+function renderSidebarTabPanel(
+  tabId: SidebarTabId,
+  panel: HTMLElement,
+  doc: Document,
+  item: Zotero.Item,
+  handleOpenAIChat: (itemId: number) => Promise<void>,
+): void {
+  switch (tabId) {
+    case "summary":
+      renderNoteSection(panel, doc, item, "summary", { mode: "page" });
+      break;
+    case "chat":
+      if (isSidebarModuleEnabled("actionButtons")) {
+        renderFullChatEntry(panel, doc, item, handleOpenAIChat);
+      }
+      if (isSidebarModuleEnabled("quickChat")) {
+        renderChatArea(panel, doc, item, true, { mode: "page" });
+      }
+      break;
+    case "deepRead":
+      renderNoteSection(panel, doc, item, "deepRead", { mode: "page" });
+      break;
+    case "quickRead":
+      if (isSidebarModuleEnabled("table")) {
+        renderTableSection(panel, doc, item);
+      }
+      if (isSidebarModuleEnabled("mindmap")) {
+        renderMindmapSection(panel, doc, item);
+      }
+      if (isSidebarModuleEnabled("imageSummary")) {
+        renderImageSummarySection(panel, doc, item);
+      }
+      if (!panel.childElementCount) {
+        const hint = doc.createElement("div");
+        hint.className = "ai-butler-sidebar-empty";
+        hint.textContent = getString("itempane-no-enabled-tabs");
+        panel.appendChild(hint);
+      }
+      break;
+  }
+}
+
+function renderFullChatEntry(
+  body: HTMLElement,
+  doc: Document,
+  item: Zotero.Item,
+  handleOpenAIChat: (itemId: number) => Promise<void>,
+): void {
+  const entry = doc.createElement("div");
+  entry.className = "ai-butler-sidebar-chat-entry";
+
+  const meta = doc.createElement("div");
+  meta.className = "ai-butler-sidebar-chat-entry-title";
+  const metaText = doc.createElement("span");
+  metaText.textContent = getString("itempane-ai-open-chat-tooltip");
+  meta.appendChild(metaText);
+
+  const fullChatBtn = createButton(
+    doc,
+    getString("itempane-ai-open-chat"),
+    true,
+  );
+  fullChatBtn.style.flex = "0 0 auto";
+  fullChatBtn.addEventListener("click", async () => {
+    try {
+      await handleOpenAIChat(item.id);
+    } catch (error: any) {
+      ztoolkit.log("[AI-Butler] 完整追问按钮点击失败:", error);
+    }
+  });
+
+  entry.appendChild(meta);
+  entry.appendChild(fullChatBtn);
+  body.appendChild(entry);
 }
 
 /**
@@ -995,7 +1901,7 @@ function renderActionButtons(
   // 刷新按钮
   const refreshBtn = doc.createElement("button");
   refreshBtn.id = "ai-butler-refresh-btn";
-  refreshBtn.title = "重新渲染 AI 管家侧边栏";
+  refreshBtn.title = getString("itempane-refresh-tooltip");
   refreshBtn.textContent = "🔄";
   refreshBtn.style.cssText = `
     padding: 8px 12px;
@@ -1039,6 +1945,10 @@ function renderActionButtons(
   body.appendChild(btnContainer);
 }
 
+type SidebarNoteRenderOptions = {
+  mode?: "card" | "page";
+};
+
 /**
  * 渲染 AI 笔记区域
  */
@@ -1047,10 +1957,25 @@ function renderNoteSection(
   doc: Document,
   item: Zotero.Item,
   noteKind: AiNoteKind = "summary",
+  options: SidebarNoteRenderOptions = {},
 ): void {
+  const isPageMode = options.mode === "page";
   const noteSection = doc.createElement("div");
-  noteSection.className = "ai-butler-note-section";
-  noteSection.style.cssText = `
+  noteSection.className = isPageMode
+    ? "ai-butler-note-section ai-butler-note-page"
+    : "ai-butler-note-section";
+  noteSection.style.cssText = isPageMode
+    ? `
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  `
+    : `
     margin-bottom: 12px;
     border: 1px solid #e0e0e0;
     border-radius: 6px;
@@ -1063,7 +1988,24 @@ function renderNoteSection(
   // 笔记标题栏（可折叠）- 使用继承颜色以支持暗色模式
   const noteHeader = doc.createElement("div");
   noteHeader.className = "ai-butler-note-header";
-  noteHeader.style.cssText = `
+  noteHeader.style.cssText = isPageMode
+    ? `
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    padding: 8px 10px;
+    background: rgba(128, 128, 128, 0.035);
+    cursor: default;
+    user-select: none;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.14);
+    width: 100%;
+    max-width: 100%;
+    flex: 0 0 auto;
+    box-sizing: border-box;
+    overflow: visible;
+  `
+    : `
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -1091,8 +2033,10 @@ function renderNoteSection(
     min-width: 0;
     overflow-wrap: anywhere;
   `;
-  const noteLabel = noteKind === "summary" ? "AI 总结" : "AI 精读";
-  noteTitle.innerHTML = `📄 <span>${noteLabel}</span>`;
+  const noteLabel = getSidebarNoteKindLabel(noteKind);
+  noteTitle.innerHTML = isPageMode
+    ? `<span>${noteLabel}</span>`
+    : `📄 <span>${noteLabel}</span>`;
 
   const headerTopRow = doc.createElement("div");
   headerTopRow.style.cssText = `
@@ -1156,15 +2100,19 @@ function renderNoteSection(
   );
   metadataMenu.style.cssText = `
     display: none;
-    margin: 6px 8px 0;
-    max-height: 240px;
+    margin: 6px 8px 8px;
+    min-height: 52px;
+    max-height: min(280px, 42vh);
     overflow-y: auto;
-    padding: 6px;
-    border: 1px solid rgba(128, 128, 128, 0.22);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.92);
+    overflow-x: hidden;
+    padding: 8px;
+    border: 1px solid rgba(89, 192, 188, 0.22);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.96);
     color: inherit;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 8px 22px rgba(15, 23, 42, 0.1);
+    flex: 0 0 auto;
+    z-index: 4;
   `;
 
   metadataButton.addEventListener("click", (e: Event) => {
@@ -1244,7 +2192,19 @@ function renderNoteSection(
   // 笔记内容区域
   const noteContentWrapper = doc.createElement("div");
   noteContentWrapper.className = "ai-butler-note-content-wrapper";
-  noteContentWrapper.style.cssText = `
+  noteContentWrapper.style.cssText = isPageMode
+    ? `
+    position: relative;
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  `
+    : `
     position: relative;
     height: ${savedNoteHeight}px;
     min-height: 50px;
@@ -1261,8 +2221,8 @@ function renderNoteSection(
   noteContent.id = getSidebarNoteElementId("ai-butler-note-content", noteKind);
   noteContent.dataset.aiNoteKind = noteKind;
   noteContent.style.cssText = `
-    padding: 10px;
-    padding-bottom: 20px;
+    padding: ${isPageMode ? "14px 12px 28px" : "10px"};
+    padding-bottom: ${isPageMode ? "28px" : "20px"};
     font-size: ${currentFontSize}px;
     line-height: 1.6;
     overflow-wrap: anywhere;
@@ -1311,7 +2271,7 @@ function renderNoteSection(
     return btn;
   };
 
-  personalizationRow.appendChild(createFontBtn("−", -1));
+  personalizationRow.appendChild(createFontBtn("?", -1));
   personalizationRow.appendChild(fontSizeLabel);
   personalizationRow.appendChild(createFontBtn("+", 1));
 
@@ -1333,7 +2293,7 @@ function renderNoteSection(
   // 添加内置主题选项
   const themes = [
     { id: "github", name: "GitHub" },
-    { id: "redstriking", name: "红印" },
+    { id: "redstriking", name: getString("theme-redstriking-name") },
   ];
   const currentTheme = (
     (getPref("markdownTheme" as any) as string) || "github"
@@ -1367,8 +2327,8 @@ function renderNoteSection(
 
   // 恢复默认高度按钮
   const resetHeightBtn = doc.createElement("button");
-  resetHeightBtn.textContent = "↕";
-  resetHeightBtn.title = "恢复默认高度";
+  resetHeightBtn.textContent = "?";
+  resetHeightBtn.title = getString("itempane-note-reset-height");
   resetHeightBtn.style.cssText = `
     width: 20px;
     height: 20px;
@@ -1432,8 +2392,10 @@ function renderNoteSection(
   };
 
   const editBtn = createNoteActionBtn(
-    "✎",
-    noteKind === "summary" ? "编辑 AI 总结" : "编辑 AI 精读",
+    "✏️",
+    noteKind === "summary"
+      ? getString("itempane-note-edit-summary")
+      : getString("itempane-note-edit-deep-read"),
   );
   editBtn.id = getSidebarNoteElementId("ai-butler-edit-note-btn", noteKind);
   editBtn.addEventListener("click", async (e: Event) => {
@@ -1442,7 +2404,10 @@ function renderNoteSection(
   });
   mainControls.appendChild(editBtn);
 
-  const deleteBlockBtn = createNoteActionBtn("✕", "删除当前模型总结");
+  const deleteBlockBtn = createNoteActionBtn(
+    "🗑️",
+    getString("itempane-note-delete-current-model-summary"),
+  );
   deleteBlockBtn.id = getSidebarNoteElementId(
     "ai-butler-delete-note-block-btn",
     noteKind,
@@ -1454,10 +2419,10 @@ function renderNoteSection(
   metadataPicker.appendChild(deleteBlockBtn);
 
   const saveBtn = createNoteActionBtn(
-    "保存",
+    getString("itempane-note-save-button"),
     noteKind === "summary"
-      ? "保存侧边栏内的 AI 总结修改"
-      : "保存侧边栏内的 AI 精读修改",
+      ? getString("itempane-note-save-summary-tooltip")
+      : getString("itempane-note-save-deep-read-tooltip"),
     42,
   );
   saveBtn.id = getSidebarNoteElementId("ai-butler-save-note-btn", noteKind);
@@ -1468,7 +2433,11 @@ function renderNoteSection(
   });
   mainControls.appendChild(saveBtn);
 
-  const cancelBtn = createNoteActionBtn("取消", "取消编辑并恢复预览", 42);
+  const cancelBtn = createNoteActionBtn(
+    getString("itempane-note-cancel-button"),
+    getString("itempane-note-cancel-tooltip"),
+    42,
+  );
   cancelBtn.id = getSidebarNoteElementId("ai-butler-cancel-note-btn", noteKind);
   cancelBtn.style.display = "none";
   cancelBtn.addEventListener("click", (e: Event) => {
@@ -1496,9 +2465,12 @@ function renderNoteSection(
 
   const personalizeBtn = doc.createElement("button");
   personalizeBtn.textContent = "🎛️";
-  personalizeBtn.title = "个性化";
+  personalizeBtn.title = getString("itempane-note-personalize");
   personalizeBtn.type = "button";
-  personalizeBtn.setAttribute("aria-label", "个性化");
+  personalizeBtn.setAttribute(
+    "aria-label",
+    getString("itempane-note-personalize"),
+  );
   personalizeBtn.style.cssText = `
     width: 20px;
     height: 20px;
@@ -1539,7 +2511,7 @@ function renderNoteSection(
   // 复制 Markdown 按钮
   const copyBtn = doc.createElement("button");
   copyBtn.textContent = "📋";
-  copyBtn.title = "复制为 Markdown";
+  copyBtn.title = getString("itempane-copy-markdown");
   copyBtn.id = getSidebarNoteElementId("ai-butler-copy-note-btn", noteKind);
   copyBtn.style.cssText = `
     width: 20px;
@@ -1570,7 +2542,7 @@ function renderNoteSection(
       // 复制到剪贴板
       await copyToClipboard(doc, markdownContent);
       // 显示成功反馈
-      copyBtn.textContent = "✓";
+      copyBtn.textContent = "✅";
       copyBtn.style.color = "#4caf50";
       setTimeout(() => {
         copyBtn.textContent = "📋";
@@ -1605,7 +2577,9 @@ function renderNoteSection(
 
   headerTopRow.appendChild(noteTitle);
   headerTopRow.appendChild(mainControls);
-  headerTopRow.appendChild(toggleIcon);
+  if (!isPageMode) {
+    headerTopRow.appendChild(toggleIcon);
+  }
   noteHeader.appendChild(headerTopRow);
   noteHeader.appendChild(personalizationRow);
 
@@ -1618,52 +2592,58 @@ function renderNoteSection(
     noteHeightPrefKey,
   );
 
-  // 折叠/展开功能 - 从首选项读取初始状态
-  let isCollapsed = getPref(noteCollapsedPrefKey as any) === true;
-
-  // 根据初始状态设置UI
-  if (isCollapsed) {
-    noteContentWrapper.style.height = "0px";
-    noteContentWrapper.style.overflow = "hidden";
+  if (isPageMode) {
     resizeHandle.style.display = "none";
-    toggleIcon.style.transform = "rotate(-90deg)";
-  }
+  } else {
+    // 折叠/展开功能 - 从首选项读取初始状态
+    let isCollapsed = getPref(noteCollapsedPrefKey as any) === true;
 
-  noteHeader.addEventListener("click", () => {
-    if (isSidebarNoteEditing(item.id)) {
-      setSidebarNoteEditStatus(
-        doc,
-        "编辑中，请先保存或取消。",
-        undefined,
-        noteKind,
-      );
-      return;
-    }
-    isCollapsed = !isCollapsed;
-    // 保存折叠状态到首选项
-    setPref(noteCollapsedPrefKey as any, isCollapsed as any);
+    // 根据初始状态设置UI
     if (isCollapsed) {
       noteContentWrapper.style.height = "0px";
       noteContentWrapper.style.overflow = "hidden";
       resizeHandle.style.display = "none";
       toggleIcon.style.transform = "rotate(-90deg)";
-    } else {
-      const restoreHeight = parseInt(
-        (getPref(noteHeightPrefKey as any) as string) ||
-          String(DEFAULT_NOTE_HEIGHT),
-        10,
-      );
-      noteContentWrapper.style.height = `${restoreHeight}px`;
-      noteContentWrapper.style.overflowY = "auto";
-      resizeHandle.style.display = "flex";
-      toggleIcon.style.transform = "rotate(0deg)";
     }
-  });
+
+    noteHeader.addEventListener("click", () => {
+      if (isSidebarNoteEditing(item.id)) {
+        setSidebarNoteEditStatus(
+          doc,
+          getString("itempane-note-editing-save-or-cancel"),
+          undefined,
+          noteKind,
+        );
+        return;
+      }
+      isCollapsed = !isCollapsed;
+      // 保存折叠状态到首选项
+      setPref(noteCollapsedPrefKey as any, isCollapsed as any);
+      if (isCollapsed) {
+        noteContentWrapper.style.height = "0px";
+        noteContentWrapper.style.overflow = "hidden";
+        resizeHandle.style.display = "none";
+        toggleIcon.style.transform = "rotate(-90deg)";
+      } else {
+        const restoreHeight = parseInt(
+          (getPref(noteHeightPrefKey as any) as string) ||
+            String(DEFAULT_NOTE_HEIGHT),
+          10,
+        );
+        noteContentWrapper.style.height = `${restoreHeight}px`;
+        noteContentWrapper.style.overflowY = "auto";
+        resizeHandle.style.display = "flex";
+        toggleIcon.style.transform = "rotate(0deg)";
+      }
+    });
+  }
 
   noteSection.appendChild(noteHeader);
   noteSection.appendChild(metadataMenu);
   noteSection.appendChild(noteContentWrapper);
-  noteSection.appendChild(resizeHandle);
+  if (!isPageMode) {
+    noteSection.appendChild(resizeHandle);
+  }
   body.appendChild(noteSection);
 
   updateSidebarNoteEditControls(doc, "missing", "", undefined, noteKind);
@@ -1712,11 +2692,11 @@ async function loadTableContent(
         });
       });
     } else {
-      container.innerHTML = `<div style="color: #9e9e9e; font-size: 12px; text-align: center; padding: 12px;">暂无填表数据</div>`;
+      container.innerHTML = `<div style="color: #9e9e9e; font-size: 12px; text-align: center; padding: 12px;">${getString("itempane-table-empty")}</div>`;
     }
   } catch (error) {
     ztoolkit.log("[AI-Butler] 加载表格内容失败:", error);
-    container.innerHTML = `<div style="color: #9e9e9e; font-size: 12px; text-align: center; padding: 12px;">加载失败</div>`;
+    container.innerHTML = `<div style="color: #9e9e9e; font-size: 12px; text-align: center; padding: 12px;">${getString("itempane-load-failed", { args: { error: escapeHtmlForChat(error instanceof Error ? error.message : String(error)) } })}</div>`;
   }
 }
 
@@ -1765,7 +2745,7 @@ function renderTableSection(
     align-items: center;
     gap: 6px;
   `;
-  tableTitle.innerHTML = `📊 <span>表格归纳</span>`;
+  tableTitle.innerHTML = `📊 <span>${getString("itempane-table-title")}</span>`;
 
   // 异步加载综述状态徽章
   void (async () => {
@@ -1792,15 +2772,15 @@ function renderTableSection(
 
     let badges = "";
     if (hasTable) {
-      badges += `<span style="margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;background:rgba(76,175,80,0.15);color:#4caf50;">📊 已填表</span>`;
+      badges += `<span style="margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;background:rgba(76,175,80,0.15);color:#4caf50;">${getString("itempane-table-badge-filled")}</span>`;
     }
     if (isReviewed) {
-      badges += `<span style="margin-left:4px;padding:1px 5px;border-radius:3px;font-size:9px;background:rgba(99,102,241,0.15);color:#6366f1;">✅ 已综述</span>`;
+      badges += `<span style="margin-left:4px;padding:1px 5px;border-radius:3px;font-size:9px;background:rgba(99,102,241,0.15);color:#6366f1;">${getString("itempane-table-badge-reviewed")}</span>`;
     }
     if (badges) {
       const titleSpan = tableTitle.querySelector("span");
       if (titleSpan) {
-        titleSpan.innerHTML = `表格归纳${badges}`;
+        titleSpan.innerHTML = `${getString("itempane-table-title")}${badges}`;
       }
     }
   })();
@@ -1818,8 +2798,8 @@ function renderTableSection(
 
   // 重新填表按钮
   const refillBtn = doc.createElement("button");
-  refillBtn.textContent = "🔄 重新生成";
-  refillBtn.title = "重新填表";
+  refillBtn.textContent = getString("itempane-regenerate");
+  refillBtn.title = getString("itempane-regenerate-table");
   refillBtn.style.cssText = `
     padding: 2px 8px;
     border: 1px solid currentColor;
@@ -1843,19 +2823,20 @@ function renderTableSection(
     refillBtn.style.background = "transparent";
   });
   refillBtn.addEventListener("click", async () => {
-    refillBtn.textContent = "⏳ 生成中...";
+    refillBtn.textContent = getString("itempane-generating");
     refillBtn.style.pointerEvents = "none";
     try {
       const { LiteratureReviewService } =
         await import("./literatureReviewService");
-      const { DEFAULT_TABLE_TEMPLATE, DEFAULT_TABLE_FILL_PROMPT } =
+      const { getConfiguredTableTemplate, getConfiguredTableFillPrompt } =
         await import("../utils/prompts");
 
-      const tableTemplate =
-        (getPref("tableTemplate" as any) as string) || DEFAULT_TABLE_TEMPLATE;
-      const fillPrompt =
-        (getPref("tableFillPrompt" as any) as string) ||
-        DEFAULT_TABLE_FILL_PROMPT;
+      const tableTemplate = getConfiguredTableTemplate(
+        getPref("tableTemplate" as any) as string,
+      );
+      const fillPrompt = getConfiguredTableFillPrompt(
+        getPref("tableFillPrompt" as any) as string,
+      );
 
       // 先删除已有 AI-Table 笔记
       const noteIDs = (item as any).getNotes?.() || [];
@@ -1895,7 +2876,7 @@ function renderTableSection(
     } catch (err) {
       ztoolkit.log("[AI-Butler] 重新填表失败:", err);
     } finally {
-      refillBtn.textContent = "🔄 重新生成";
+      refillBtn.textContent = getString("itempane-regenerate");
       refillBtn.style.pointerEvents = "auto";
     }
   });
@@ -2044,7 +3025,7 @@ function renderImageSummarySection(
     align-items: center;
     gap: 6px;
   `;
-  imageSummaryTitle.innerHTML = `🖼️ <span>一图总结</span>`;
+  imageSummaryTitle.innerHTML = `🖼️ <span>${getString("itempane-image-title")}</span>`;
 
   // 按钮容器
   const imageBtnContainer = doc.createElement("div");
@@ -2162,7 +3143,7 @@ function renderMindmapSection(
     align-items: center;
     gap: 6px;
   `;
-  mindmapTitle.innerHTML = `🧠 <span>思维导图</span>`;
+  mindmapTitle.innerHTML = `🧠 <span>${getString("itempane-mindmap-title")}</span>`;
 
   const mindmapToggleIcon = doc.createElement("span");
   mindmapToggleIcon.textContent = "▼";
@@ -2289,7 +3270,7 @@ async function loadMindmapContent(
 
     if (!mindmapNote) {
       const generateMindmapBtn = doc.createElement("button");
-      generateMindmapBtn.textContent = "🧠 生成思维导图";
+      generateMindmapBtn.textContent = getString("itempane-generate-mindmap");
       generateMindmapBtn.style.cssText = `
         padding: 8px 16px;
         border: 1px solid #4caf50;
@@ -2310,15 +3291,19 @@ async function loadMindmapContent(
       generateMindmapBtn.addEventListener("click", async () => {
         try {
           generateMindmapBtn.disabled = true;
-          generateMindmapBtn.textContent = "正在加入队列...";
+          generateMindmapBtn.textContent = getString(
+            "itempane-adding-to-queue",
+          );
           const { TaskQueueManager } = await import("./taskQueue");
           const queueManager = TaskQueueManager.getInstance();
           await queueManager.addMindmapTask(targetItem);
-          generateMindmapBtn.textContent = "✅ 已加入队列";
+          generateMindmapBtn.textContent = getString("itempane-added-to-queue");
         } catch (err: any) {
-          generateMindmapBtn.textContent = "❌ 失败";
+          generateMindmapBtn.textContent = getString("itempane-failed");
           setTimeout(() => {
-            generateMindmapBtn.textContent = "🧠 生成思维导图";
+            generateMindmapBtn.textContent = getString(
+              "itempane-generate-mindmap",
+            );
             generateMindmapBtn.disabled = false;
           }, 2000);
         }
@@ -2327,7 +3312,7 @@ async function loadMindmapContent(
       container.innerHTML = `
         <div style="text-align: center; color: #9e9e9e; padding: 16px;">
           <div style="font-size: 24px; margin-bottom: 8px;">🧠</div>
-          <div style="font-size: 12px; margin-bottom: 8px;">暂无思维导图</div>
+          <div style="font-size: 12px; margin-bottom: 8px;">${getString("itempane-no-mindmap")}</div>
         </div>
       `;
       container.appendChild(generateMindmapBtn);
@@ -2370,7 +3355,7 @@ async function loadMindmapContent(
       container.innerHTML = `
         <div style="text-align: center; color: #9e9e9e; padding: 16px;">
           <div style="font-size: 24px; margin-bottom: 8px;">⚠️</div>
-          <div>思维导图格式错误</div>
+          <div>${getString("itempane-mindmap-format-error")}</div>
         </div>
       `;
       return;
@@ -2386,7 +3371,7 @@ async function loadMindmapContent(
       container.innerHTML = `
         <div style="text-align: center; color: #9e9e9e; padding: 16px;">
           <div style="font-size: 24px; margin-bottom: 8px;">📄</div>
-          <div>思维导图内容为空</div>
+          <div>${getString("itempane-mindmap-empty")}</div>
         </div>
       `;
       return;
@@ -2470,7 +3455,7 @@ async function loadMindmapContent(
               closeTime: 3000,
             })
               .createLine({
-                text: "打开思维导图预览窗口失败",
+                text: getString("itempane-mindmap-open-viewer-failed"),
                 type: "error",
               })
               .show();
@@ -2552,9 +3537,13 @@ async function loadMindmapContent(
             ztoolkit.log("[AI-Butler] 思维导图已保存到:", filePath);
 
             // 显示通知
-            new ztoolkit.ProgressWindow("思维导图已导出")
+            new ztoolkit.ProgressWindow(
+              getString("itempane-mindmap-exported-title"),
+            )
               .createLine({
-                text: `已保存到桌面: ${filename}`,
+                text: getString("itempane-mindmap-exported-to-desktop", {
+                  args: { filename },
+                }),
                 type: "success",
               })
               .show();
@@ -2567,9 +3556,13 @@ async function loadMindmapContent(
             }
           } catch (e) {
             ztoolkit.log("[AI-Butler] 保存思维导图失败:", e);
-            new ztoolkit.ProgressWindow("导出失败")
+            new ztoolkit.ProgressWindow(
+              getString("itempane-mindmap-export-failed"),
+            )
               .createLine({
-                text: `错误: ${e}`,
+                text: getString("itempane-mindmap-export-error", {
+                  args: { message: String(e) },
+                }),
                 type: "error",
               })
               .show();
@@ -2625,7 +3618,7 @@ async function loadMindmapContent(
     }
   } catch (err: any) {
     ztoolkit.log("[AI-Butler] 加载思维导图失败:", err);
-    container.innerHTML = `<div style="color: #d32f2f; padding: 10px;">加载思维导图失败: ${err.message}</div>`;
+    container.innerHTML = `<div style="color: #d32f2f; padding: 10px;">${getString("itempane-mindmap-load-failed", { args: { message: escapeHtmlForChat(err.message) } })}</div>`;
   }
 }
 
@@ -2645,6 +3638,28 @@ async function ensureQuickChatKatexCss(doc: Document): Promise<void> {
 #ai-butler-inline-chat * {
   box-sizing: border-box;
 }
+#ai-butler-inline-chat {
+  width: 100%;
+  inline-size: 100%;
+  max-width: 100%;
+  max-inline-size: 100%;
+  min-width: 0;
+  min-inline-size: 0;
+  overflow-x: hidden;
+  contain: inline-size;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-pair,
+#ai-butler-inline-chat .ai-butler-quick-chat-user,
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant {
+  width: 100%;
+  inline-size: 100%;
+  max-width: 100%;
+  max-inline-size: 100%;
+  min-width: 0;
+  min-inline-size: 0;
+  overflow-x: hidden;
+  contain: inline-size;
+}
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant,
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant * {
   min-width: 0;
@@ -2653,6 +3668,14 @@ async function ensureQuickChatKatexCss(doc: Document): Promise<void> {
   overflow-wrap: anywhere;
   word-break: break-word;
   white-space: normal;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex,
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-display,
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex * {
+  max-width: none !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
+  white-space: nowrap !important;
 }
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant p {
   margin: 0.35em 0;
@@ -2700,7 +3723,7 @@ async function ensureQuickChatKatexCss(doc: Document): Promise<void> {
   border-left: 5px solid #f22f27;
 }
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant h4 {
-  display: inline-block;
+  display: block;
   font-size: 1em;
   padding: 0.1em 0.45em;
   border: 1px solid #f22f27;
@@ -2732,27 +3755,69 @@ async function ensureQuickChatKatexCss(doc: Document): Promise<void> {
 }
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant table {
   display: block;
-  width: max-content;
+  width: 100%;
   max-width: 100%;
   overflow-x: auto;
   border-collapse: collapse;
 }
-#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-display,
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant th,
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant td {
+  max-width: 220px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-scroll-container,
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant pre,
 #ai-butler-inline-chat .ai-butler-quick-chat-assistant table {
   overflow-x: auto;
   overflow-y: hidden;
 }
-#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-inline {
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-scroll-container {
+  display: block;
+  width: 100%;
+  inline-size: 100%;
   max-width: 100%;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  max-inline-size: 100%;
+  min-width: 0;
+  min-inline-size: 0;
+  margin: 0.5em 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  padding-bottom: 0.2em;
+  white-space: nowrap !important;
+  contain: inline-size;
 }
-#ai-butler-inline-chat .katex-display {
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-scroll-container .katex-display {
+  display: inline-block !important;
+  width: auto;
+  min-width: 0;
+  max-width: none !important;
+  margin: 0;
+  overflow: visible !important;
+  text-align: left;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-scroll-container .katex {
+  display: inline-block !important;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-inline {
+  display: inline-block;
   max-width: 100%;
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: visible;
+  vertical-align: middle;
+  white-space: nowrap !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
+}
+#ai-butler-inline-chat .ai-butler-quick-chat-assistant .katex-inline > .katex {
+  display: inline-block !important;
+  max-width: none !important;
+}
+#ai-butler-inline-chat .katex-display {
+  max-width: none !important;
+  overflow-x: visible;
+  overflow-y: visible;
 }
 #ai-butler-inline-chat .katex-inline {
   overflow-wrap: normal;
@@ -2772,9 +3837,17 @@ function renderChatArea(
   doc: Document,
   item: Zotero.Item,
   initiallyVisible = false,
+  options: { mode?: "card" | "page" } = {},
 ): void {
-  currentChatState.abortController?.abort("快速追问界面已刷新");
+  const isPageMode = options.mode === "page";
+  currentChatState.abortController?.abort(
+    getString("itempane-quick-chat-abort-refreshed"),
+  );
   currentChatState.conversationHistory = [];
+  currentChatState.relatedItems = [];
+  currentChatState.relatedMode = "summary";
+  currentChatState.relatedContextSignature = "";
+  currentChatState.relatedContextIncludedCount = 0;
   currentChatState.isChatting = false;
   currentChatState.abortController = null;
   currentChatState.savedPairIds = new Set();
@@ -2785,11 +3858,19 @@ function renderChatArea(
   chatArea.style.cssText = `
     display: ${initiallyVisible ? "flex" : "none"};
     flex-direction: column;
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 6px;
+    width: 100%;
+    inline-size: 100%;
+    max-width: 100%;
+    max-inline-size: 100%;
+    min-width: 0;
+    min-inline-size: 0;
+    ${isPageMode ? "height: 100%; min-height: 0; flex: 1 1 auto;" : ""}
+    contain: inline-size;
+    border: 1px solid rgba(89, 192, 188, 0.22);
+    border-radius: 10px;
     overflow: hidden;
-    background: transparent;
-    margin-bottom: 12px;
+    background: rgba(255, 255, 255, 0.72);
+    margin-bottom: ${isPageMode ? "0" : "12px"};
   `;
 
   const chatHeader = doc.createElement("div");
@@ -2804,7 +3885,7 @@ function renderChatArea(
     font-weight: 500;
   `;
   const chatTitle = doc.createElement("span");
-  chatTitle.textContent = "💬 快速追问";
+  chatTitle.textContent = getString("itempane-quick-chat-title");
   chatHeader.appendChild(chatTitle);
   chatHeader.appendChild(
     createContextInfoIcon(doc, getString("itempane-ai-temp-chat-tooltip")),
@@ -2884,35 +3965,335 @@ function renderChatArea(
     return button;
   };
 
-  const decreaseFontBtn = createQuickControlButton("−", "减小快速追问字号");
-  const increaseFontBtn = createQuickControlButton("+", "增大快速追问字号");
-  const decreaseHeightBtn = createQuickControlButton("⇡", "降低快速追问高度");
-  const increaseHeightBtn = createQuickControlButton("⇣", "增加快速追问高度");
-  const resetHeightBtn = createQuickControlButton("↕", "恢复快速追问默认高度");
-
+  const newConversationBtn = createQuickControlButton(
+    "🧹",
+    getString("itempane-quick-chat-new-conversation"),
+  );
+  const decreaseFontBtn = createQuickControlButton(
+    "A−",
+    getString("itempane-quick-chat-decrease-font"),
+  );
+  const increaseFontBtn = createQuickControlButton(
+    "A+",
+    getString("itempane-quick-chat-increase-font"),
+  );
+  chatControls.appendChild(newConversationBtn);
   chatControls.appendChild(decreaseFontBtn);
   chatControls.appendChild(quickFontLabel);
   chatControls.appendChild(increaseFontBtn);
-  chatControls.appendChild(decreaseHeightBtn);
-  chatControls.appendChild(increaseHeightBtn);
-  chatControls.appendChild(resetHeightBtn);
   chatHeader.appendChild(chatControls);
 
   // 消息显示区
   const messagesArea = doc.createElement("div");
+  messagesArea.className = "ai-butler-quick-chat-messages";
   messagesArea.style.cssText = `
-    height: ${currentQuickChatHeight}px;
-    min-height: 100px;
-    max-height: 520px;
+    height: ${isPageMode ? "auto" : `${currentQuickChatHeight}px`};
+    ${isPageMode ? "flex: 1 1 auto;" : ""}
+    width: 100%;
+    inline-size: 100%;
+    max-width: 100%;
+    max-inline-size: 100%;
+    min-width: 0;
+    min-inline-size: 0;
+    contain: inline-size;
+    min-height: ${isPageMode ? "0" : "100px"};
+    max-height: ${isPageMode ? "none" : "520px"};
     overflow-y: auto;
     overflow-x: hidden;
-    resize: vertical;
     padding: 8px;
     font-size: ${currentQuickChatFontSize}px;
     line-height: 1.5;
     user-select: text;
     cursor: text;
   `;
+
+  const getRelatedModeLabel = (mode = currentChatState.relatedMode): string =>
+    mode === "summary"
+      ? getString("itempane-related-mode-summary")
+      : getString("itempane-related-mode-fulltext");
+
+  const relatedPanel = doc.createElement("div");
+  relatedPanel.style.cssText = `
+    display: none;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    padding: 0 2px 4px;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.14);
+  `;
+
+  const relatedChipList = doc.createElement("div");
+  relatedChipList.style.cssText = `
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  `;
+  relatedPanel.appendChild(relatedChipList);
+
+  const relatedStatus = doc.createElement("span");
+  relatedStatus.style.cssText = `
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: rgba(128, 128, 128, 0.9);
+  `;
+
+  const createRelatedButton = (text: string, title?: string) => {
+    const button = doc.createElement("button");
+    button.textContent = text;
+    if (title) button.title = title;
+    button.style.cssText = `
+      height: 28px;
+      min-width: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 8px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    `;
+    button.addEventListener("mouseenter", () => {
+      if (button.disabled) return;
+      button.style.background = "rgba(89, 192, 188, 0.12)";
+      button.style.borderColor = "rgba(89, 192, 188, 0.45)";
+    });
+    button.addEventListener("mouseleave", () => {
+      const outlined = button.dataset.outlined === "true";
+      button.style.background =
+        button.dataset.active === "true"
+          ? "rgba(89, 192, 188, 0.16)"
+          : "transparent";
+      button.style.borderColor =
+        button.dataset.active === "true"
+          ? "rgba(89, 192, 188, 0.55)"
+          : outlined
+            ? "rgba(89, 192, 188, 0.45)"
+            : "transparent";
+    });
+    return button;
+  };
+
+  const openPickerBtn = createRelatedButton(
+    "📎",
+    getString("itempane-related-open-picker"),
+  );
+  openPickerBtn.setAttribute(
+    "aria-label",
+    getString("itempane-related-open-picker"),
+  );
+  openPickerBtn.dataset.outlined = "true";
+  openPickerBtn.style.color = "#00b894";
+  openPickerBtn.style.fontSize = "15px";
+  openPickerBtn.style.borderColor = "rgba(89, 192, 188, 0.45)";
+
+  const clearRelatedBtn = createRelatedButton(
+    getString("itempane-related-clear"),
+    getString("itempane-related-clear-title"),
+  );
+  clearRelatedBtn.style.fontSize = "11px";
+  clearRelatedBtn.style.padding = "0 9px";
+
+  let quickChatPinnedToBottom = true;
+
+  const setRelatedStatus = (
+    message: string,
+    color = "rgba(128, 128, 128, 0.9)",
+  ): void => {
+    relatedStatus.textContent = message;
+    relatedStatus.style.color = color;
+  };
+
+  const renderRelatedControls = (): void => {
+    relatedChipList.innerHTML = "";
+    for (const ref of currentChatState.relatedItems) {
+      const chip = doc.createElement("span");
+      chip.style.cssText = `
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        gap: 5px;
+        padding: 3px 7px;
+        border-radius: 999px;
+        background: rgba(89, 192, 188, 0.18);
+        border: 1px solid rgba(89, 192, 188, 0.42);
+        color: inherit;
+        font-size: 11px;
+        line-height: 1.35;
+      `;
+
+      const chipIcon = doc.createElement("span");
+      chipIcon.textContent = "📄";
+      chipIcon.style.cssText = `
+        flex-shrink: 0;
+        font-size: 10px;
+        opacity: 0.82;
+      `;
+      chip.appendChild(chipIcon);
+
+      const chipText = doc.createElement("span");
+      chipText.textContent = ref.title;
+      chipText.style.cssText = `
+        display: inline-block;
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      `;
+      chip.appendChild(chipText);
+
+      const removeBtn = doc.createElement("button");
+      removeBtn.textContent = "×";
+      removeBtn.title = getString("itempane-related-remove");
+      removeBtn.style.cssText = `
+        border: none;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        padding: 0 2px;
+        font-size: 13px;
+        line-height: 1;
+        opacity: 0.75;
+      `;
+      removeBtn.addEventListener("click", () => {
+        currentChatState.relatedItems = currentChatState.relatedItems.filter(
+          (candidate) => candidate.itemId !== ref.itemId,
+        );
+        resetQuickChatConversationForRelatedChange(
+          getString("itempane-related-context-updated"),
+        );
+        renderRelatedControls();
+      });
+      chip.appendChild(removeBtn);
+      relatedChipList.appendChild(chip);
+    }
+
+    const hasRelatedItems = currentChatState.relatedItems.length > 0;
+    relatedPanel.style.display = hasRelatedItems ? "flex" : "none";
+    openPickerBtn.dataset.active = hasRelatedItems ? "true" : "false";
+    openPickerBtn.style.background = hasRelatedItems
+      ? "rgba(89, 192, 188, 0.16)"
+      : "transparent";
+    openPickerBtn.style.borderColor = hasRelatedItems
+      ? "rgba(89, 192, 188, 0.55)"
+      : "rgba(89, 192, 188, 0.45)";
+    clearRelatedBtn.disabled = currentChatState.relatedItems.length === 0;
+    clearRelatedBtn.style.opacity =
+      currentChatState.relatedItems.length === 0 ? "0.45" : "1";
+    clearRelatedBtn.style.display =
+      currentChatState.relatedItems.length === 0 ? "none" : "inline-flex";
+
+    if (currentChatState.relatedItems.length === 0) {
+      setRelatedStatus("");
+    } else {
+      const summary = getString("itempane-related-count", {
+        args: {
+          count: currentChatState.relatedItems.length,
+          mode: getRelatedModeLabel(),
+        },
+      });
+      setRelatedStatus(summary);
+    }
+  };
+
+  function resetQuickChatConversationForRelatedChange(message: string): void {
+    currentChatState.abortController?.abort(message);
+    currentChatState.conversationHistory = [];
+    currentChatState.relatedContextSignature = "";
+    currentChatState.relatedContextIncludedCount = 0;
+    currentChatState.isChatting = false;
+    currentChatState.abortController = null;
+    currentChatState.savedPairIds = new Set();
+    messagesArea.innerHTML = `<div style="color: #777; text-align: center; padding: 10px;">${escapeHtmlForChat(message)}</div>`;
+    quickChatPinnedToBottom = true;
+  }
+
+  function showRelatedLimitMessage(mode = currentChatState.relatedMode): void {
+    const limit = getQuickChatRelatedLimit(mode);
+    setRelatedStatus(
+      getString("itempane-related-limit-items", {
+        args: {
+          mode: getRelatedModeLabel(mode),
+          max: limit.maxItems,
+        },
+      }),
+      "#f44336",
+    );
+  }
+
+  function applyRelatedSelection(
+    refs: QuickChatRelatedItemRef[],
+    mode: QuickChatRelatedMode,
+  ): boolean {
+    const validation = validateQuickChatRelatedSelection(refs, mode);
+    if (!validation.ok) {
+      showRelatedLimitMessage(mode);
+      return false;
+    }
+
+    const previousSignature = createQuickChatRelatedContextSignature(
+      currentChatState.relatedMode,
+      currentChatState.relatedItems,
+    );
+    const nextSignature = createQuickChatRelatedContextSignature(mode, refs);
+
+    currentChatState.relatedMode = mode;
+    currentChatState.relatedItems = refs;
+    renderRelatedControls();
+
+    if (previousSignature === nextSignature) {
+      return false;
+    }
+
+    resetQuickChatConversationForRelatedChange(
+      refs.length === 0
+        ? getString("itempane-related-context-cleared")
+        : getString("itempane-related-context-updated"),
+    );
+    renderRelatedControls();
+    if (refs.length > 0) {
+      setRelatedStatus(
+        getString("itempane-related-applied-count", {
+          args: {
+            count: refs.length,
+            mode: getRelatedModeLabel(mode),
+          },
+        }),
+        "#4caf50",
+      );
+    }
+    return true;
+  }
+
+  async function pickRelatedItemsFromCollection(): Promise<void> {
+    const result = await openQuickChatRelatedSelectorDialog(
+      doc,
+      item.id,
+      currentChatState.relatedItems,
+      currentChatState.relatedMode,
+    );
+    if (!result) return;
+    applyRelatedSelection(result.refs, result.mode);
+  }
+
+  openPickerBtn.addEventListener("click", () => {
+    void pickRelatedItemsFromCollection();
+  });
+  clearRelatedBtn.addEventListener("click", () => {
+    if (currentChatState.relatedItems.length === 0) return;
+    applyRelatedSelection([], currentChatState.relatedMode);
+  });
+  renderRelatedControls();
 
   const applyQuickChatFontSize = (nextSize: number): void => {
     currentQuickChatFontSize = Math.max(10, Math.min(20, nextSize));
@@ -2924,30 +4305,18 @@ function renderChatArea(
     );
   };
 
-  const applyQuickChatHeight = (nextHeight: number): void => {
-    currentQuickChatHeight = Math.max(100, Math.min(520, nextHeight));
-    messagesArea.style.height = `${currentQuickChatHeight}px`;
-    setPref(
-      "sidebarQuickChatHeight" as any,
-      String(currentQuickChatHeight) as any,
-    );
-  };
-
   decreaseFontBtn.addEventListener("click", () => {
     applyQuickChatFontSize(currentQuickChatFontSize - 1);
   });
   increaseFontBtn.addEventListener("click", () => {
     applyQuickChatFontSize(currentQuickChatFontSize + 1);
   });
-  decreaseHeightBtn.addEventListener("click", () => {
-    applyQuickChatHeight(currentQuickChatHeight - 40);
-  });
-  increaseHeightBtn.addEventListener("click", () => {
-    applyQuickChatHeight(currentQuickChatHeight + 40);
-  });
-  resetHeightBtn.addEventListener("click", () => {
-    applyQuickChatHeight(DEFAULT_QUICK_CHAT_HEIGHT);
-  });
+
+  const quickChatResizeHandle = createResizeHandle(
+    doc,
+    messagesArea,
+    "sidebarQuickChatHeight",
+  );
 
   // 输入区域
   const isQuickChatAtBottom = (): boolean =>
@@ -2955,7 +4324,6 @@ function renderChatArea(
       messagesArea.scrollTop -
       messagesArea.clientHeight <
     8;
-  let quickChatPinnedToBottom = true;
   messagesArea.addEventListener("scroll", () => {
     quickChatPinnedToBottom = isQuickChatAtBottom();
   });
@@ -2969,71 +4337,196 @@ function renderChatArea(
 
   const inputArea = doc.createElement("div");
   inputArea.style.cssText = `
-    display: flex;
-    gap: 6px;
     padding: 8px;
     border-top: 1px solid rgba(128, 128, 128, 0.2);
-    background: transparent;
+    background: rgba(128, 128, 128, 0.025);
+  `;
+
+  const composer = doc.createElement("div");
+  composer.style.cssText = `
+    width: 100%;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    box-sizing: border-box;
+    padding: 7px;
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    border-radius: 15px;
+    background: rgba(128, 128, 128, 0.045);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   `;
 
   const inputBox = doc.createElement("textarea");
-  inputBox.placeholder = "输入问题...";
+  inputBox.placeholder = getString("itempane-question-placeholder");
   inputBox.style.cssText = `
-    flex: 1;
-    min-height: 36px;
-    max-height: 80px;
-    padding: 6px 8px;
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 4px;
+    width: 100%;
+    min-height: 38px;
+    max-height: 96px;
+    box-sizing: border-box;
+    padding: 2px 6px;
+    border: none;
+    outline: none;
     resize: none;
     font-size: 12px;
+    line-height: 1.45;
     font-family: inherit;
     color: inherit;
     background: transparent;
   `;
 
+  const composerToolbar = doc.createElement("div");
+  composerToolbar.style.cssText = `
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  `;
+
+  const composerTools = doc.createElement("div");
+  composerTools.style.cssText = `
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    flex: 1;
+  `;
+
+  const composerActions = doc.createElement("div");
+  composerActions.style.cssText = `
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  `;
+
   const sendBtn = doc.createElement("button");
-  sendBtn.textContent = "发送";
+  sendBtn.textContent = "↑";
+  sendBtn.title = getString("itempane-send");
   sendBtn.style.cssText = `
-    padding: 6px 12px;
+    min-width: 28px;
+    height: 28px;
+    padding: 0 9px;
     background: #59c0bc;
     color: white;
     border: none;
-    border-radius: 4px;
+    border-radius: 999px;
     cursor: pointer;
-    font-size: 12px;
-    align-self: flex-end;
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   `;
 
   const stopBtn = doc.createElement("button");
-  stopBtn.textContent = "\u7ec8\u6b62";
-  stopBtn.title = "\u7ec8\u6b62\u5f53\u524d\u5feb\u901f\u8ffd\u95ee";
+  stopBtn.textContent = getString("itempane-stop");
+  stopBtn.title = getString("itempane-stop-current");
   stopBtn.style.cssText = `
     display: none;
-    padding: 6px 12px;
+    height: 28px;
+    padding: 0 10px;
     background: #f44336;
     color: white;
     border: none;
-    border-radius: 4px;
+    border-radius: 999px;
     cursor: pointer;
     font-size: 12px;
-    align-self: flex-end;
+    line-height: 1;
+    align-items: center;
+    justify-content: center;
   `;
   stopBtn.addEventListener("click", () => {
     if (!currentChatState.isChatting) return;
-    stopBtn.textContent = "\u7ec8\u6b62\u4e2d...";
+    stopBtn.textContent = getString("itempane-stopping");
     stopBtn.style.background = "#9e9e9e";
     (stopBtn as HTMLButtonElement).disabled = true;
-    currentChatState.abortController?.abort(
-      "\u7528\u6237\u5df2\u7ec8\u6b62\u5feb\u901f\u8ffd\u95ee",
-    );
+    currentChatState.abortController?.abort(getString("itempane-stop-current"));
   });
 
-  inputArea.appendChild(inputBox);
-  inputArea.appendChild(stopBtn);
-  inputArea.appendChild(sendBtn);
+  const resizeQuickChatInput = (): void => {
+    inputBox.style.height = "auto";
+    inputBox.style.height = `${Math.min(96, Math.max(38, inputBox.scrollHeight))}px`;
+  };
+  inputBox.addEventListener("input", resizeQuickChatInput);
+  inputBox.addEventListener("focus", () => {
+    composer.style.borderColor = "rgba(89, 192, 188, 0.7)";
+    composer.style.boxShadow = "0 0 0 2px rgba(89, 192, 188, 0.12)";
+  });
+  inputBox.addEventListener("blur", () => {
+    composer.style.borderColor = "rgba(128, 128, 128, 0.28)";
+    composer.style.boxShadow = "inset 0 1px 0 rgba(255, 255, 255, 0.06)";
+  });
+
+  const startNewQuickChatConversation = (): void => {
+    currentChatState.abortController?.abort(
+      getString("itempane-quick-chat-new-conversation-abort"),
+    );
+    currentChatState.conversationHistory = [];
+    currentChatState.relatedContextSignature = "";
+    currentChatState.relatedContextIncludedCount = 0;
+    currentChatState.isChatting = false;
+    currentChatState.abortController = null;
+    currentChatState.savedPairIds = new Set();
+
+    messagesArea.innerHTML = `<div style="color: #777; text-align: center; padding: 10px;">${escapeHtmlForChat(getString("itempane-quick-chat-new-conversation-created"))}</div>`;
+    inputBox.value = "";
+    resizeQuickChatInput();
+    sendBtn.textContent = "↑";
+    sendBtn.title = getString("itempane-send");
+    sendBtn.style.background = "#59c0bc";
+    (sendBtn as HTMLButtonElement).disabled = false;
+    stopBtn.style.display = "none";
+    (stopBtn as HTMLButtonElement).disabled = false;
+    (inputBox as HTMLTextAreaElement).disabled = false;
+    quickChatPinnedToBottom = true;
+    inputBox.focus();
+  };
+
+  newConversationBtn.addEventListener("click", async () => {
+    const hasConversationContent =
+      currentChatState.conversationHistory.length > 0 ||
+      currentChatState.isChatting ||
+      currentChatState.savedPairIds.size > 0 ||
+      messagesArea.querySelector("[data-pair-id]") !== null;
+    if (!hasConversationContent) {
+      startNewQuickChatConversation();
+      return;
+    }
+
+    const suppressWarning = Boolean(
+      getPref("quickChatSuppressNewConversationWarning"),
+    );
+    if (!suppressWarning) {
+      const confirmed = await confirmQuickChatNewConversation(doc);
+      if (!confirmed.ok) return;
+      if (confirmed.suppressFutureWarning) {
+        setPref("quickChatSuppressNewConversationWarning", true);
+      }
+    }
+
+    startNewQuickChatConversation();
+  });
+
+  composerTools.appendChild(openPickerBtn);
+  composerTools.appendChild(relatedStatus);
+  composerTools.appendChild(clearRelatedBtn);
+  composerActions.appendChild(stopBtn);
+  composerActions.appendChild(sendBtn);
+  composerToolbar.appendChild(composerTools);
+  composerToolbar.appendChild(composerActions);
+  composer.appendChild(relatedPanel);
+  composer.appendChild(inputBox);
+  composer.appendChild(composerToolbar);
+  inputArea.appendChild(composer);
   chatArea.appendChild(chatHeader);
   chatArea.appendChild(messagesArea);
+  if (!isPageMode) {
+    chatArea.appendChild(quickChatResizeHandle);
+  }
+  inputArea.style.flex = "0 0 auto";
   chatArea.appendChild(inputArea);
   body.appendChild(chatArea);
 
@@ -3051,7 +4544,7 @@ function renderChatArea(
   const loadPdfContentIfNeeded = async (): Promise<void> => {
     if (currentChatState.pdfContent) {
       if (!messagesArea.textContent?.trim()) {
-        messagesArea.innerHTML = `<div style="color: #4caf50; text-align: center; padding: 10px;">✅ 论文内容已加载，可以开始提问！</div>`;
+        messagesArea.innerHTML = `<div style="color: #4caf50; text-align: center; padding: 10px;">${getString("itempane-chat-pdf-loaded")}</div>`;
       }
       return;
     }
@@ -3059,30 +4552,29 @@ function renderChatArea(
     // 如果尚未加载 PDF 内容，则加载
     if (item) {
       try {
-        const { PDFExtractor } = await import("./pdfExtractor");
+        const { ContentExtractor } = await import("./contentExtractor");
         const { default: LLMService } = await import("./llmService");
         const pdfMode = LLMService.getEffectivePdfProcessMode();
-        const isBase64 = pdfMode === "base64";
 
-        messagesArea.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">📄 正在加载论文内容...</div>`;
+        messagesArea.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-chat-loading-pdf")}</div>`;
 
-        let pdfContent = "";
-        if (isBase64) {
-          pdfContent = await PDFExtractor.extractBase64FromItem(item);
-        } else {
-          pdfContent = await PDFExtractor.extractTextFromItem(item, pdfMode);
-        }
+        const { content: pdfContent, isBase64 } =
+          await ContentExtractor.extractAnalyzableContentFromItem(
+            item,
+            pdfMode === "base64",
+            pdfMode,
+          );
 
         if (pdfContent) {
           currentChatState.pdfContent = pdfContent;
           currentChatState.isBase64 = isBase64;
-          messagesArea.innerHTML = `<div style="color: #4caf50; text-align: center; padding: 10px;">✅ 论文内容已加载，可以开始提问！</div>`;
+          messagesArea.innerHTML = `<div style="color: #4caf50; text-align: center; padding: 10px;">${getString("itempane-chat-pdf-loaded")}</div>`;
         } else {
-          messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">❌ 无法加载论文内容，请确保该文献有 PDF 附件</div>`;
+          messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">${getString("itempane-chat-pdf-load-unavailable")}</div>`;
         }
       } catch (err: any) {
         ztoolkit.log("[AI-Butler] 快速追问加载 PDF 失败:", err);
-        messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">❌ 加载失败: ${err?.message || "未知错误"}</div>`;
+        messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">${getString("itempane-chat-load-failed", { args: { message: escapeHtmlForChat(err?.message || getString("common-unknown-error")) } })}</div>`;
       }
     }
   };
@@ -3136,20 +4628,21 @@ function renderChatArea(
 
     // 检查是否有 PDF 内容
     if (!currentChatState.pdfContent) {
-      messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">❌ 请先等待论文内容加载完成</div>`;
+      messagesArea.innerHTML = `<div style="color: #f44336; text-align: center; padding: 10px;">${getString("itempane-chat-wait-pdf-loaded")}</div>`;
       return;
     }
 
     // 设置为正在聊天状态
     currentChatState.isChatting = true;
     currentChatState.abortController = createChatAbortController();
-    sendBtn.textContent = "\u751f\u6210\u4e2d";
+    sendBtn.textContent = "…";
+    sendBtn.title = getString("itempane-generating-status");
     sendBtn.style.background = "#9e9e9e";
     (sendBtn as HTMLButtonElement).disabled = true;
-    stopBtn.textContent = "\u7ec8\u6b62";
+    stopBtn.textContent = getString("itempane-stop");
     stopBtn.style.background = "#f44336";
     (stopBtn as HTMLButtonElement).disabled = false;
-    stopBtn.style.display = "block";
+    stopBtn.style.display = "inline-flex";
     (inputBox as HTMLTextAreaElement).disabled = false;
 
     // 生成唯一对话对 ID
@@ -3158,7 +4651,15 @@ function renderChatArea(
 
     // 创建对话对容器
     const pairWrapper = doc.createElement("div");
+    pairWrapper.className = "ai-butler-quick-chat-pair";
     pairWrapper.style.cssText = `
+      width: 100%;
+      inline-size: 100%;
+      max-width: 100%;
+      max-inline-size: 100%;
+      min-width: 0;
+      min-inline-size: 0;
+      contain: inline-size;
       margin-bottom: 12px;
       padding: 8px;
       border: 1px solid rgba(128, 128, 128, 0.2);
@@ -3171,7 +4672,15 @@ function renderChatArea(
 
     // 显示用户问题
     const userMsgDiv = doc.createElement("div");
+    userMsgDiv.className = "ai-butler-quick-chat-user";
     userMsgDiv.style.cssText = `
+      width: 100%;
+      inline-size: 100%;
+      max-width: 100%;
+      max-inline-size: 100%;
+      min-width: 0;
+      min-inline-size: 0;
+      contain: inline-size;
       margin-bottom: 8px;
       padding: 8px;
       background: rgba(89, 192, 188, 0.1);
@@ -3179,8 +4688,11 @@ function renderChatArea(
       border-left: 3px solid #59c0bc;
       user-select: text;
       cursor: text;
+      overflow-x: hidden;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     `;
-    userMsgDiv.innerHTML = `<strong>👤 您:</strong> ${escapeHtmlForChat(question)}`;
+    userMsgDiv.innerHTML = `<strong>${getString("itempane-user-label")}</strong> ${escapeHtmlForChat(question)}`;
     pairWrapper.appendChild(userMsgDiv);
 
     // 创建 AI 回复区域
@@ -3193,8 +4705,12 @@ function renderChatArea(
       border-radius: 6px;
       border-left: 3px solid #667eea;
       width: 100%;
+      inline-size: 100%;
       max-width: 100%;
+      max-inline-size: 100%;
       min-width: 0;
+      min-inline-size: 0;
+      contain: inline-size;
       overflow-x: hidden;
       overflow-wrap: anywhere;
       word-break: break-word;
@@ -3202,7 +4718,7 @@ function renderChatArea(
       user-select: text;
       cursor: text;
     `;
-    aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong> <em style="color: #999;">思考中...</em>`;
+    aiMsgDiv.innerHTML = `<strong>${getString("itempane-assistant-label")}</strong> <em style="color: #999;">${getString("itempane-thinking")}</em>`;
     pairWrapper.appendChild(aiMsgDiv);
 
     // 创建保存按钮区域（初始隐藏）
@@ -3213,7 +4729,7 @@ function renderChatArea(
       margin-top: 4px;
     `;
     const saveBtn = doc.createElement("button");
-    saveBtn.textContent = "💾 保存为笔记";
+    saveBtn.textContent = getString("itempane-save-note");
     saveBtn.style.cssText = `
       padding: 4px 10px;
       background: #667eea;
@@ -3224,7 +4740,7 @@ function renderChatArea(
       font-size: 11px;
     `;
     const copyBtn = doc.createElement("button");
-    copyBtn.textContent = "📋 复制回答";
+    copyBtn.textContent = getString("itempane-copy-answer");
     copyBtn.style.cssText = `
       padding: 4px 10px;
       background: #59c0bc;
@@ -3237,8 +4753,11 @@ function renderChatArea(
     `;
     copyBtn.addEventListener("click", async () => {
       const copied = await copyQuickChatText(doc, fullResponse || "");
-      const originalText = copyBtn.textContent || "📋 复制回答";
-      copyBtn.textContent = copied ? "✅ 已复制" : "❌ 复制失败";
+      const originalText =
+        copyBtn.textContent || getString("itempane-copy-answer");
+      copyBtn.textContent = copied
+        ? getString("itempane-copied")
+        : getString("itempane-copy-failed");
       copyBtn.style.background = copied ? "#4caf50" : "#f44336";
       setTimeout(() => {
         copyBtn.textContent = originalText;
@@ -3255,14 +4774,77 @@ function renderChatArea(
 
     // 清空输入框
     inputBox.value = "";
+    resizeQuickChatInput();
     let fullResponse = "";
 
     try {
       const { default: LLMService } = await import("./llmService");
 
+      let relatedContextResult: QuickChatRelatedContextResult | null = null;
+      let conversationQuestion = question;
+      let sourceLabel = getString("itempane-quick-chat-source-label");
+      if (currentChatState.relatedItems.length > 0) {
+        const nextSignature = createQuickChatRelatedContextSignature(
+          currentChatState.relatedMode,
+          currentChatState.relatedItems,
+        );
+        if (
+          currentChatState.relatedContextSignature &&
+          currentChatState.relatedContextSignature !== nextSignature
+        ) {
+          currentChatState.conversationHistory = [];
+        }
+
+        if (currentChatState.conversationHistory.length === 0) {
+          setRelatedStatus(getString("itempane-related-context-loading"));
+          relatedContextResult = await resolveQuickChatRelatedContext(
+            currentChatState.relatedItems,
+            currentChatState.relatedMode,
+          );
+          currentChatState.relatedContextSignature =
+            relatedContextResult.signature;
+          currentChatState.relatedContextIncludedCount =
+            relatedContextResult.included.length;
+
+          if (relatedContextResult.skipped.length > 0) {
+            setRelatedStatus(
+              getString("itempane-related-context-skipped", {
+                args: { count: relatedContextResult.skipped.length },
+              }),
+              "#ff9800",
+            );
+          }
+          if (relatedContextResult.included.length > 0) {
+            conversationQuestion = buildQuickChatQuestionWithRelatedContext(
+              question,
+              relatedContextResult,
+            );
+            sourceLabel = getString("itempane-related-source-label", {
+              args: {
+                count: relatedContextResult.included.length,
+                mode: getRelatedModeLabel(),
+              },
+            });
+          } else {
+            setRelatedStatus(
+              getString("itempane-related-context-none"),
+              "#ff9800",
+            );
+            sourceLabel = getString("itempane-quick-chat-source-label");
+          }
+        } else if (currentChatState.relatedContextIncludedCount > 0) {
+          sourceLabel = getString("itempane-related-source-label", {
+            args: {
+              count: currentChatState.relatedContextIncludedCount,
+              mode: getRelatedModeLabel(),
+            },
+          });
+        }
+      }
+
       const conversationHistory = buildQuickChatConversation(
         currentChatState.conversationHistory,
-        question,
+        conversationQuestion,
       );
 
       let responseMetadata: LLMNoteMetadata | null = null;
@@ -3293,7 +4875,7 @@ function renderChatArea(
 
       currentChatState.conversationHistory = appendQuickChatTurn(
         currentChatState.conversationHistory,
-        question,
+        conversationQuestion,
         fullResponse,
       );
 
@@ -3304,12 +4886,12 @@ function renderChatArea(
       saveBtn.addEventListener("click", async () => {
         // 检查是否已保存过
         if (currentChatState.savedPairIds.has(pairId)) {
-          saveBtn.textContent = "✅ 已保存";
+          saveBtn.textContent = getString("itempane-saved");
           return;
         }
 
         // 标记正在保存
-        saveBtn.textContent = "💾 保存中...";
+        saveBtn.textContent = getString("itempane-saving");
         saveBtn.style.background = "#9e9e9e";
         (saveBtn as HTMLButtonElement).disabled = true;
 
@@ -3320,13 +4902,14 @@ function renderChatArea(
             question,
             fullResponse,
             responseMetadata,
+            sourceLabel,
           );
           currentChatState.savedPairIds.add(pairId);
-          saveBtn.textContent = "✅ 已保存";
+          saveBtn.textContent = getString("itempane-saved");
           saveBtn.style.background = "#4caf50";
         } catch (err: any) {
           ztoolkit.log("[AI-Butler] 保存快速追问对话失败:", err);
-          saveBtn.textContent = "❌ 保存失败";
+          saveBtn.textContent = getString("itempane-save-failed");
           saveBtn.style.background = "#f44336";
           (saveBtn as HTMLButtonElement).disabled = false;
         }
@@ -3337,20 +4920,21 @@ function renderChatArea(
           updateQuickChatAssistantMessage(
             aiMsgDiv,
             fullResponse,
-            `<div style="color: #777; font-size: 11px; margin-top: 6px;">已终止，本轮不会保存或加入上下文。</div>`,
+            `<div style="color: #777; font-size: 11px; margin-top: 6px;">${getString("itempane-stopped-note")}</div>`,
           );
         } else {
-          aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong> <span style="color: #777;">已终止，未生成内容。</span>`;
+          aiMsgDiv.innerHTML = `<strong>${getString("itempane-assistant-label")}</strong> <span style="color: #777;">${getString("itempane-stopped-empty")}</span>`;
         }
         return;
       }
       ztoolkit.log("[AI-Butler] 快速追问发送失败:", err);
-      aiMsgDiv.innerHTML = `<strong>🤖 AI管家:</strong> <span style="color: #f44336;">❌ 错误: ${err?.message || "发送失败"}</span>`;
+      aiMsgDiv.innerHTML = `<strong>${getString("itempane-assistant-label")}</strong> <span style="color: #f44336;">${getString("itempane-error", { args: { error: err?.message || getString("itempane-send-failed") } })}</span>`;
     } finally {
       // 恢复状态
       currentChatState.isChatting = false;
       currentChatState.abortController = null;
-      sendBtn.textContent = "\u53d1\u9001";
+      sendBtn.textContent = "↑";
+      sendBtn.title = getString("itempane-send");
       sendBtn.style.background = "#59c0bc";
       (sendBtn as HTMLButtonElement).disabled = false;
       stopBtn.style.display = "none";
@@ -3367,6 +4951,148 @@ function renderChatArea(
       e.preventDefault();
       sendBtn.click();
     }
+  });
+}
+
+async function confirmQuickChatNewConversation(
+  doc: Document,
+): Promise<{ ok: boolean; suppressFutureWarning: boolean }> {
+  const host = doc.body || doc.documentElement;
+  if (!host) return { ok: false, suppressFutureWarning: false };
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const overlay = doc.createElement("div");
+    overlay.style.cssText = `
+      position: fixed;
+      inset: 0;
+      z-index: 100000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.28);
+      box-sizing: border-box;
+    `;
+
+    const dialog = doc.createElement("div");
+    dialog.style.cssText = `
+      width: min(420px, calc(100vw - 32px));
+      max-width: 100%;
+      padding: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.32);
+      border-radius: 14px;
+      background: Canvas;
+      color: CanvasText;
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.26);
+      font-family: system-ui, -apple-system, sans-serif;
+      box-sizing: border-box;
+    `;
+    overlay.appendChild(dialog);
+
+    const finish = (ok: boolean, suppressFutureWarning = false): void => {
+      if (resolved) return;
+      resolved = true;
+      doc.defaultView?.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+      resolve({ ok, suppressFutureWarning });
+    };
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      }
+    };
+    doc.defaultView?.addEventListener("keydown", onKeyDown, true);
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) finish(false);
+    });
+
+    const title = doc.createElement("div");
+    title.textContent = getString("itempane-quick-chat-new-conversation-title");
+    title.style.cssText = `
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    `;
+    dialog.appendChild(title);
+
+    const message = doc.createElement("div");
+    message.textContent = getString(
+      "itempane-quick-chat-new-conversation-message",
+    );
+    message.style.cssText = `
+      font-size: 12px;
+      line-height: 1.55;
+      color: rgba(128, 128, 128, 0.98);
+      margin-bottom: 12px;
+    `;
+    dialog.appendChild(message);
+
+    const optionLabel = doc.createElement("label");
+    optionLabel.style.cssText = `
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      margin-bottom: 14px;
+      cursor: pointer;
+      user-select: none;
+    `;
+    const dontRemindCheckbox = doc.createElement("input");
+    dontRemindCheckbox.type = "checkbox";
+    optionLabel.appendChild(dontRemindCheckbox);
+    const optionText = doc.createElement("span");
+    optionText.textContent = getString(
+      "itempane-quick-chat-new-conversation-dont-remind",
+    );
+    optionLabel.appendChild(optionText);
+    dialog.appendChild(optionLabel);
+
+    const actions = doc.createElement("div");
+    actions.style.cssText = `
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    `;
+
+    const cancelBtn = doc.createElement("button");
+    cancelBtn.textContent = getString("dialog-button-cancel");
+    cancelBtn.style.cssText = `
+      padding: 6px 12px;
+      border: 1px solid rgba(148, 163, 184, 0.42);
+      border-radius: 8px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 12px;
+    `;
+    cancelBtn.addEventListener("click", () => finish(false));
+
+    const confirmBtn = doc.createElement("button");
+    confirmBtn.textContent = getString(
+      "itempane-quick-chat-new-conversation-confirm",
+    );
+    confirmBtn.style.cssText = `
+      padding: 6px 12px;
+      border: none;
+      border-radius: 8px;
+      background: #59c0bc;
+      color: white;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+    `;
+    confirmBtn.addEventListener("click", () =>
+      finish(true, dontRemindCheckbox.checked),
+    );
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    dialog.appendChild(actions);
+    host.appendChild(overlay);
+    confirmBtn.focus();
   });
 }
 
@@ -3469,7 +5195,7 @@ function buildQuickChatAssistantHtml(
   markdown: string,
   suffixHtml = "",
 ): string {
-  return `<strong>🤖 AI管家:</strong><br/>${renderQuickChatMarkdown(markdown)}${suffixHtml}`;
+  return `<strong>${getString("itempane-assistant-label")}</strong><br/>${renderQuickChatMarkdown(markdown)}${suffixHtml}`;
 }
 
 function updateQuickChatAssistantMessage(
@@ -3494,7 +5220,7 @@ function updateQuickChatAssistantMessage(
         "[AI-Butler] 快速追问清洗后仍写入失败，已降级为纯文本:",
         retryError,
       );
-      container.textContent = `🤖 AI管家:\n${sanitizeQuickChatDomString(markdown)}`;
+      container.textContent = `${getString("itempane-assistant-label")}\n${sanitizeQuickChatDomString(markdown)}`;
     }
   }
 }
@@ -3543,7 +5269,8 @@ async function copyQuickChatText(
  * 获取或创建"AI管家-后续追问"独立笔记
  */
 async function getOrCreateChatNote(item: Zotero.Item): Promise<Zotero.Item> {
-  const title = (item.getField("title") as string) || "文献";
+  const title =
+    (item.getField("title") as string) || getString("common-paper-title");
 
   // 查找已有的聊天笔记
   const noteIDs = (item as any).getNotes?.() || [];
@@ -3567,7 +5294,7 @@ async function getOrCreateChatNote(item: Zotero.Item): Promise<Zotero.Item> {
   const note = new Zotero.Item("note");
   note.libraryID = item.libraryID;
   note.parentID = item.id;
-  const header = `<h2>AI 管家 - 后续追问 - ${escapeHtmlForNote(title)}</h2>`;
+  const header = `<h2>${getString("itempane-chat-note-title", { args: { title: escapeHtmlForNote(title) } })}</h2>`;
   note.setNote(header);
   note.addTag("AI-Butler-Chat");
   await note.saveTx();
@@ -3595,6 +5322,7 @@ async function saveChatPairToNote(
   userMessage: string,
   assistantMessage: string,
   metadata?: LLMNoteMetadata | null,
+  sourceLabel = getString("itempane-quick-chat-source-label"),
 ): Promise<void> {
   const note = await getOrCreateChatNote(item);
   let noteHtml = (note as any).getNote?.() || "";
@@ -3615,7 +5343,7 @@ async function saveChatPairToNote(
     pairId,
     userMessage,
     assistantMessage,
-    sourceLabel: "来自快速追问",
+    sourceLabel,
   });
   const block = metadata
     ? LLMNoteMetadataService.wrapHtml(blockContent, metadata)
@@ -3805,9 +5533,11 @@ function hideSidebarMetadataPicker(
 function getSummaryBlockShortLabel(
   block: ReturnType<typeof LLMNoteMetadataService.parseSummaryBlocks>[number],
 ): string {
-  if (!block.metadata) return "\u672a\u8bb0\u5f55\u6a21\u578b";
-  const provider = block.metadata.providerName || "Unknown";
-  const model = block.metadata.modelId || "unknown";
+  if (!block.metadata) return getString("itempane-note-model-not-recorded");
+  const provider =
+    block.metadata.providerName || getString("llm-metadata-unknown-provider");
+  const model =
+    block.metadata.modelId || getString("llm-metadata-unknown-model");
   return `${provider} / ${model}`;
 }
 
@@ -3823,7 +5553,9 @@ function updateSidebarMetadataButtonLabel(
   ) as HTMLButtonElement | null;
   if (!button) return;
 
-  button.textContent = `\u7b14\u8bb0 ${selectedIndex + 1}/${total} \u25be`;
+  button.textContent = getString("itempane-note-selector-label", {
+    args: { current: selectedIndex + 1, total },
+  });
   button.title = getSummaryBlockShortLabel(block);
 }
 
@@ -4005,7 +5737,7 @@ async function startSidebarNoteEdit(
       updateSidebarNoteEditControls(
         doc,
         "missing",
-        "暂无可编辑笔记。",
+        getString("itempane-note-no-editable-note"),
         undefined,
         noteKind,
       );
@@ -4051,7 +5783,7 @@ async function startSidebarNoteEdit(
     updateSidebarNoteEditControls(
       doc,
       "editing",
-      "编辑中",
+      getString("itempane-note-editing"),
       undefined,
       noteKind,
     );
@@ -4066,7 +5798,9 @@ async function startSidebarNoteEdit(
     updateSidebarNoteEditControls(
       doc,
       "preview",
-      `编辑失败: ${err?.message || err}`,
+      getString("itempane-note-edit-failed", {
+        args: { message: String(err?.message || err) },
+      }),
       "#d32f2f",
       getNoteKindFromElement(noteContent),
     );
@@ -4086,7 +5820,7 @@ async function saveSidebarNoteEdit(
   updateSidebarNoteEditControls(
     doc,
     "saving",
-    "保存中...",
+    getString("itempane-note-saving"),
     undefined,
     noteKind,
   );
@@ -4094,15 +5828,13 @@ async function saveSidebarNoteEdit(
   try {
     const latestNote = await Zotero.Items.getAsync(editState.noteId);
     if (!latestNote) {
-      throw new Error("当前 AI 总结 / AI 精读不存在或已被删除");
+      throw new Error(getString("itempane-note-edit-missing"));
     }
 
     const latestHtml: string = (latestNote as any).getNote?.() || "";
     const latestDateModified = String((latestNote as any).dateModified || "");
     if (latestHtml !== editState.originalRawHtml) {
-      throw new Error(
-        "当前 AI 总结 / AI 精读已在其他地方更新，请复制草稿后刷新再编辑。",
-      );
+      throw new Error(getString("itempane-note-stale-error"));
     }
     if (
       latestDateModified &&
@@ -4123,7 +5855,7 @@ async function saveSidebarNoteEdit(
         (block) => block.blockId === editState.blockId,
       );
       if (!expectedBlock) {
-        throw new Error("当前 AI 总结 / AI 精读结构已变化，请刷新后再编辑。");
+        throw new Error(getString("itempane-note-edit-structure-changed"));
       }
     }
 
@@ -4143,13 +5875,18 @@ async function saveSidebarNoteEdit(
     updateSidebarNoteEditControls(
       doc,
       "preview",
-      "已保存",
+      getString("itempane-note-saved"),
       "#4caf50",
       noteKind,
     );
-    noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+    noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
     await loadNoteContent(doc, item, noteContent, noteKind);
-    setSidebarNoteEditStatus(doc, "已保存", "#4caf50", noteKind);
+    setSidebarNoteEditStatus(
+      doc,
+      getString("itempane-note-saved"),
+      "#4caf50",
+      noteKind,
+    );
     setTimeout(() => {
       if (!isSidebarNoteEditing(item.id)) {
         setSidebarNoteEditStatus(doc, "", undefined, noteKind);
@@ -4161,7 +5898,7 @@ async function saveSidebarNoteEdit(
     updateSidebarNoteEditControls(
       doc,
       "editing",
-      err?.message || "保存失败",
+      err?.message || getString("itempane-note-save-failed"),
       "#d32f2f",
       noteKind,
     );
@@ -4179,8 +5916,14 @@ function cancelSidebarNoteEdit(
 
   sidebarNoteEditState = null;
   resetSidebarNoteContentEditMode(noteContent);
-  updateSidebarNoteEditControls(doc, "preview", "已取消", undefined, noteKind);
-  noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在恢复...</div>`;
+  updateSidebarNoteEditControls(
+    doc,
+    "preview",
+    getString("itempane-note-cancelled"),
+    undefined,
+    noteKind,
+  );
+  noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-restoring")}</div>`;
   void loadNoteContent(doc, item, noteContent, noteKind);
 }
 
@@ -4192,7 +5935,7 @@ async function deleteSidebarSummaryBlock(
   if (isSidebarNoteEditing(item.id)) {
     setSidebarNoteEditStatus(
       doc,
-      "编辑中，不能删除模型总结。",
+      getString("itempane-note-editing-cannot-delete"),
       "#d32f2f",
       getNoteKindFromElement(noteContent),
     );
@@ -4206,7 +5949,7 @@ async function deleteSidebarSummaryBlock(
       updateSidebarNoteEditControls(
         doc,
         "missing",
-        "暂无可删除笔记。",
+        getString("itempane-note-no-deletable-note"),
         undefined,
         noteKind,
       );
@@ -4220,7 +5963,7 @@ async function deleteSidebarSummaryBlock(
       updateSidebarNoteEditControls(
         doc,
         "missing",
-        "暂无可删除总结。",
+        getString("itempane-note-no-deletable-summary"),
         undefined,
         noteKind,
       );
@@ -4237,14 +5980,14 @@ async function deleteSidebarSummaryBlock(
       LLMNoteMetadataService.formatSummaryBlockSelectorLabel(selectedBlock);
     const ok = Services.prompt.confirm(
       Zotero.getMainWindow() as any,
-      "删除模型总结",
-      `确定删除当前 AI 总结版本吗？\n\n${label}`,
+      getString("itempane-delete-summary-title"),
+      getString("itempane-delete-summary-confirm", { args: { label } }),
     );
     if (!ok) return;
 
     const latestNote = await Zotero.Items.getAsync(resolvedNote.note.id);
     if (!latestNote) {
-      throw new Error("当前 AI 总结 / AI 精读不存在或已被删除");
+      throw new Error(getString("itempane-note-edit-missing"));
     }
 
     const latestHtml: string = (latestNote as any).getNote?.() || "";
@@ -4255,7 +5998,7 @@ async function deleteSidebarSummaryBlock(
       (block) => block.blockId === selectedBlock.blockId,
     );
     if (!latestBlock) {
-      throw new Error("当前 AI 总结 / AI 精读结构已变化，请刷新后再删除。");
+      throw new Error(getString("itempane-note-delete-structure-changed"));
     }
 
     const nextHtml = LLMNoteMetadataService.removeSummaryBlock(
@@ -4265,11 +6008,13 @@ async function deleteSidebarSummaryBlock(
     if (!LLMNoteMetadataService.hasSummaryBlocks(nextHtml)) {
       await (latestNote as any).eraseTx?.();
       hideSidebarMetadataPicker(doc, noteKind);
-      noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+      noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
       await loadNoteContent(doc, item, noteContent, noteKind);
       setSidebarNoteEditStatus(
         doc,
-        `已删除 ${noteKind === "summary" ? "AI 总结" : "AI 精读"}`,
+        getString("itempane-note-deleted-kind", {
+          args: { kind: getSidebarNoteKindLabel(noteKind) },
+        }),
         "#4caf50",
         noteKind,
       );
@@ -4291,15 +6036,20 @@ async function deleteSidebarSummaryBlock(
       );
     }
 
-    noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">正在刷新...</div>`;
+    noteContent.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-status-refreshing")}</div>`;
     await loadNoteContent(doc, item, noteContent, noteKind);
-    setSidebarNoteEditStatus(doc, "已删除当前总结", "#4caf50", noteKind);
+    setSidebarNoteEditStatus(
+      doc,
+      getString("itempane-note-deleted-current-summary"),
+      "#4caf50",
+      noteKind,
+    );
   } catch (err: any) {
     ztoolkit.log("[AI-Butler] 删除侧边栏总结失败:", err);
     updateSidebarNoteEditControls(
       doc,
       "preview",
-      err?.message || "删除失败",
+      err?.message || getString("itempane-note-delete-failed"),
       "#d32f2f",
       getNoteKindFromElement(noteContent),
     );
@@ -4319,7 +6069,7 @@ async function loadNoteContent(
     if (isSidebarNoteEditing(item.id)) {
       setSidebarNoteEditStatus(
         doc,
-        "编辑中，已跳过刷新。",
+        getString("itempane-note-editing-skip-refresh"),
         undefined,
         noteKind,
       );
@@ -4334,8 +6084,8 @@ async function loadNoteContent(
       hideSidebarMetadataPicker(doc, noteKind);
       noteContent.innerHTML = `
         <div style="text-align: center; color: #9e9e9e; padding: 16px;">
-          <div style="font-size: 24px; margin-bottom: 8px;">📝</div>
-          <div>暂无 ${noteKind === "summary" ? "AI 总结" : "AI 精读"}</div>
+          <div style="font-size: 24px; margin-bottom: 8px;">📄</div>
+          <div>${getString("itempane-note-empty-kind", { args: { kind: getSidebarNoteKindLabel(noteKind) } })}</div>
         </div>
       `;
       updateSidebarNoteEditControls(doc, "missing", "", undefined, noteKind);
@@ -4392,7 +6142,7 @@ async function loadNoteContent(
             metadataSelector.dataset.selectedIndex || metadataSelector.value;
           setSidebarNoteEditStatus(
             doc,
-            "\u7f16\u8f91\u4e2d\uff0c\u4e0d\u80fd\u5207\u6362\u6a21\u578b\u3002",
+            getString("itempane-note-editing-cannot-switch-model"),
             undefined,
             noteKind,
           );
@@ -4420,7 +6170,7 @@ async function loadNoteContent(
           getSidebarNoteElementId("ai-butler-note-content", noteKind),
         ) as HTMLElement | null;
         if (contentEl) {
-          contentEl.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">\u6b63\u5728\u5207\u6362\u6a21\u578b...</div>`;
+          contentEl.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">${getString("itempane-note-switching-model")}</div>`;
           void loadNoteContent(
             doc,
             item,
@@ -4446,18 +6196,19 @@ async function loadNoteContent(
           itemButton.title = tooltip;
           itemButton.style.cssText = `
             display: grid;
-            grid-template-columns: auto 1fr;
-            column-gap: 8px;
+            grid-template-columns: auto minmax(0, 1fr);
+            column-gap: 10px;
             align-items: center;
             width: 100%;
-            padding: 6px 8px;
+            min-height: 38px;
+            padding: 8px 10px;
             border: 0;
-            border-radius: 6px;
+            border-radius: 8px;
             background: ${index === selectedBlockIndex ? "rgba(89, 192, 188, 0.14)" : "transparent"};
             color: inherit;
             cursor: pointer;
             font-size: 12px;
-            line-height: 1.35;
+            line-height: 1.45;
             text-align: left;
           `;
 
@@ -4465,7 +6216,8 @@ async function loadNoteContent(
           countLine.textContent = `${index + 1}/${summaryBlocks.length}`;
           countLine.style.cssText = `
             min-width: 32px;
-            font-weight: 700;
+            font-weight: 800;
+            line-height: 1.45;
             color: #59c0bc;
           `;
           const labelLine = doc.createElement("span");
@@ -4475,7 +6227,8 @@ async function loadNoteContent(
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            opacity: 0.82;
+            line-height: 1.45;
+            opacity: 0.86;
           `;
           itemButton.appendChild(countLine);
           itemButton.appendChild(labelLine);
@@ -4544,9 +6297,9 @@ async function loadNoteContent(
      * LLM 有时会在公式中输出 <br> 等 HTML 标签，需要在渲染前移除
      */
     const cleanLatex = (latex: string): string => {
-      return latex
+      return normalizeLatexForKatex(latex)
         .replace(/<br\s*\/?>/gi, " ") // <br> or <br/> -> 空格
-        .replace(/<[^>]+>/g, ""); // 移除其他 HTML 标签
+        .replace(/<\/?(?:span|br|p|div|em|strong|code|sup|sub)\b[^>]*>/gi, ""); // 移除常见 HTML 标签，保留 LaTeX 比较符号
     };
 
     // Pre-render LaTeX formulas BEFORE XML validation
@@ -4554,14 +6307,64 @@ async function loadNoteContent(
     const renderLatexFormulas = (content: string): string => {
       let result = content;
 
+      result = result.replace(
+        /<p\b([^>]*)>\s*(<span\b([^>]*)class="[^"]*\bmath\b[^"]*"([^>]*)>)/g,
+        (
+          match: string,
+          paragraphAttrs: string,
+          spanOpen: string,
+          beforeClassAttrs: string,
+          afterClassAttrs: string,
+        ) => {
+          if (
+            /text-align\s*:\s*center/i.test(paragraphAttrs) &&
+            !/\bdata-ai-butler-display-math\s*=/i.test(spanOpen)
+          ) {
+            return match.replace(
+              spanOpen,
+              `<span${beforeClassAttrs}class="math"${afterClassAttrs} data-ai-butler-display-math="true">`,
+            );
+          }
+          return match;
+        },
+      );
+
+      result = result.replace(
+        /<pre\b[^>]*class="[^"]*\bmath\b[^"]*"[^>]*>([\s\S]*?)<\/pre>/g,
+        (_match: string, innerContent: string) => {
+          const unescaped = decodeMathHtmlEntities(innerContent).trim();
+          const latex = stripMathDelimiters(unescaped);
+          try {
+            const rendered = katex.renderToString(cleanLatex(latex), {
+              throwOnError: false,
+              displayMode: true,
+              output: "html",
+              trust: true,
+              strict: false,
+            });
+            return `<div class="katex-scroll-container" style="display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;contain:inline-size;"><div class="katex-display">${rendered}</div></div>`;
+          } catch {
+            return `<code>${innerContent}</code>`;
+          }
+        },
+      );
+
       // 1. Render Zotero native format: <span class="math">...</span> (contains $...$ or $$...$$)
       result = result.replace(
-        /<span class="math">([\s\S]*?)<\/span>/g,
-        (_match: string, innerContent: string) => {
+        /<span\b([^>]*)class="[^"]*\bmath\b[^"]*"([^>]*)>([\s\S]*?)<\/span>/g,
+        (
+          _match: string,
+          beforeClassAttrs: string,
+          afterClassAttrs: string,
+          innerContent: string,
+        ) => {
           // content might be $x$ or $$x$$ or escaped HTML
           const unescaped = decodeMathHtmlEntities(innerContent);
 
           const trimmed = unescaped.trim();
+          const mathAttrs = `${beforeClassAttrs} ${afterClassAttrs}`;
+          const isMarkedDisplay =
+            /\bdata-ai-butler-display-math\s*=\s*["']true["']/i.test(mathAttrs);
 
           // Check for block formula markers
           // 1. Double dollar signs $$...$$
@@ -4572,16 +6375,18 @@ async function loadNoteContent(
             trimmed.startsWith("$") && trimmed.endsWith("$");
           const hasDisplayStyle = trimmed.includes("\\displaystyle");
 
-          const isBlock = isDoubleDollar || (isSingleDollar && hasDisplayStyle);
+          const rawLatex = stripMathDelimiters(trimmed);
+          const isTaggedDisplay = requiresDisplayMath(rawLatex);
+          const isBlock =
+            isMarkedDisplay ||
+            isDoubleDollar ||
+            (isSingleDollar && (hasDisplayStyle || isTaggedDisplay));
 
           if (isBlock) {
             // Removing delimiters
-            let latex = "";
-            if (isDoubleDollar) {
-              latex = trimmed.slice(2, -2);
-            } else {
-              latex = trimmed.slice(1, -1);
-            }
+            const latex = isDoubleDollar
+              ? trimmed.slice(2, -2)
+              : trimmed.slice(1, -1);
 
             try {
               const rendered = katex.renderToString(cleanLatex(latex), {
@@ -4591,23 +6396,23 @@ async function loadNoteContent(
                 trust: true,
                 strict: false,
               });
-              return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+              return `<div class="katex-scroll-container" style="display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;contain:inline-size;"><div class="katex-display">${rendered}</div></div>`;
             } catch {
               return `<code>${innerContent}</code>`;
             }
           } else if (isSingleDollar) {
             const latex = trimmed.slice(1, -1);
+            const isTaggedDisplay = requiresDisplayMath(latex);
             try {
               const rendered = katex.renderToString(cleanLatex(latex), {
                 throwOnError: false,
-                displayMode: false, // inline
+                displayMode: isTaggedDisplay ? true : false, // inline
                 output: "html",
                 trust: true,
                 strict: false,
               });
-              // 检查渲染后HTML长度，超过阈值则转为块级可滚动公式
-              if (rendered.length > INLINE_FORMULA_TO_BLOCK_THRESHOLD) {
-                return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+              if (isTaggedDisplay) {
+                return `<div class="katex-scroll-container" style="display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;contain:inline-size;"><div class="katex-display">${rendered}</div></div>`;
               }
               return `<span class="katex-inline">${rendered}</span>`;
             } catch {
@@ -4635,7 +6440,7 @@ async function loadNoteContent(
                 strict: false,
               },
             );
-            return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+            return `<div class="katex-scroll-container" style="display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;contain:inline-size;"><div class="katex-display">${rendered}</div></div>`;
           } catch {
             // Render failed, escape the formula for safe display
             const escaped = formula
@@ -4658,19 +6463,17 @@ async function loadNoteContent(
         inlineRegex,
         (_match: string, formula: string) => {
           try {
-            const rendered = katex.renderToString(
-              cleanLatex(decodeMathHtmlEntities(formula.trim())),
-              {
-                throwOnError: false,
-                displayMode: false,
-                output: "html",
-                trust: true,
-                strict: false,
-              },
-            );
-            // 检查渲染后HTML长度，超过阈值则转为块级可滚动公式
-            if (rendered.length > INLINE_FORMULA_TO_BLOCK_THRESHOLD) {
-              return `<div class="katex-scroll-container" style="width: 100%; overflow-x: auto; overflow-y: visible;"><div class="katex-display">${rendered}</div></div>`;
+            const latex = decodeMathHtmlEntities(formula.trim());
+            const isTaggedDisplay = requiresDisplayMath(latex);
+            const rendered = katex.renderToString(cleanLatex(latex), {
+              throwOnError: false,
+              displayMode: isTaggedDisplay ? true : false,
+              output: "html",
+              trust: true,
+              strict: false,
+            });
+            if (isTaggedDisplay) {
+              return `<div class="katex-scroll-container" style="display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;contain:inline-size;"><div class="katex-display">${rendered}</div></div>`;
             }
             return `<span class="katex-inline">${rendered}</span>`;
           } catch {
@@ -4710,7 +6513,8 @@ async function loadNoteContent(
 
     if (parserError) {
       // Extract error details
-      const errorText = parserError.textContent || "Unknown XML parsing error";
+      const errorText =
+        parserError.textContent || getString("itempane-note-xml-parse-unknown");
       const serializer = new XMLSerializer();
       const errorHtml = serializer.serializeToString(parserError);
 
@@ -4722,7 +6526,9 @@ async function loadNoteContent(
       if (locationMatch) {
         const line = parseInt(locationMatch[1], 10);
         const col = parseInt(locationMatch[2], 10);
-        errorLocation = `Line ${line}, Column ${col}`;
+        errorLocation = getString("itempane-note-xml-location", {
+          args: { line, column: col },
+        });
 
         const lines = sanitizedContent.split(/\r?\n/);
         const errorLineIndex = Math.max(0, line - 1);
@@ -4781,13 +6587,25 @@ async function loadNoteContent(
 
       const headerText = doc.createElement("div");
       headerText.style.fontWeight = "bold";
-      headerText.textContent = "⚠ 笔记渲染失败 (XML解析错误)";
+      headerText.textContent = getString("itempane-note-render-failed");
 
       // Prepare full error text for copying
-      const fullErrorText = `XML Parsing Error\n${errorText}\n\nLocation: ${errorLocation}\n\nContext:\n${errorContext}`;
+      const fullErrorText = [
+        getString("itempane-note-xml-copy-title"),
+        errorText,
+        "",
+        errorLocation
+          ? getString("itempane-note-xml-copy-location", {
+              args: { location: errorLocation },
+            })
+          : "",
+        "",
+        getString("itempane-note-xml-copy-context"),
+        errorContext,
+      ].join("\n");
 
       const copyBtn = doc.createElement("button");
-      copyBtn.textContent = "📋 复制";
+      copyBtn.textContent = getString("itempane-copy");
       copyBtn.style.cssText = `
         padding: 2px 6px;
         font-size: 12px;
@@ -4811,15 +6629,15 @@ async function loadNoteContent(
             doc.execCommand("copy");
             insertTarget.removeChild(textarea);
           }
-          copyBtn.textContent = "✅ 已复制";
+          copyBtn.textContent = getString("itempane-copied");
           setTimeout(() => {
-            copyBtn.textContent = "📋 复制";
+            copyBtn.textContent = getString("itempane-copy");
           }, 2000);
         } catch (e) {
           ztoolkit.log("[AI-Butler] Copy failed:", e);
-          copyBtn.textContent = "❌ 失败";
+          copyBtn.textContent = getString("itempane-failed");
           setTimeout(() => {
-            copyBtn.textContent = "📋 复制";
+            copyBtn.textContent = getString("itempane-copy");
           }, 2000);
         }
       });
@@ -4857,13 +6675,11 @@ async function loadNoteContent(
       noteContent.appendChild(errorContainer);
     } else {
       // LaTeX formulas already rendered before XML validation
-      // Oversized inline formulas are already converted to block format during rendering
-      // (see INLINE_FORMULA_TO_BLOCK_THRESHOLD constant)
       noteContent.innerHTML = sanitizedContent;
     }
   } catch (err: any) {
     ztoolkit.log("[AI-Butler] 加载笔记失败:", err);
-    noteContent.innerHTML = `<div style="color: #d32f2f; padding: 10px;">加载笔记失败: ${err.message}</div>`;
+    noteContent.innerHTML = `<div style="color: #d32f2f; padding: 10px;">${getString("itempane-note-load-failed", { args: { message: escapeHtmlForChat(err.message) } })}</div>`;
   }
 }
 
@@ -4896,7 +6712,9 @@ async function loadImageSummary(
     if (!imageNote) {
       // 显示生成按钮
       const generateImageBtn = doc.createElement("button");
-      generateImageBtn.textContent = "🖼️ 生成一图总结";
+      generateImageBtn.textContent = getString(
+        "itempane-generate-image-summary",
+      );
       generateImageBtn.style.cssText = `
         padding: 8px 16px;
         border: 1px solid #9c27b0;
@@ -4917,15 +6735,17 @@ async function loadImageSummary(
       generateImageBtn.addEventListener("click", async () => {
         try {
           generateImageBtn.disabled = true;
-          generateImageBtn.textContent = "正在加入队列...";
+          generateImageBtn.textContent = getString("itempane-adding-to-queue");
           const { TaskQueueManager } = await import("./taskQueue");
           const queueManager = TaskQueueManager.getInstance();
           await queueManager.addImageSummaryTask(targetItem);
-          generateImageBtn.textContent = "✅ 已加入队列";
+          generateImageBtn.textContent = getString("itempane-added-to-queue");
         } catch (err: any) {
-          generateImageBtn.textContent = "❌ 失败";
+          generateImageBtn.textContent = getString("itempane-failed");
           setTimeout(() => {
-            generateImageBtn.textContent = "🖼️ 生成一图总结";
+            generateImageBtn.textContent = getString(
+              "itempane-generate-image-summary",
+            );
             generateImageBtn.disabled = false;
           }, 2000);
         }
@@ -4934,7 +6754,7 @@ async function loadImageSummary(
       imageContainer.innerHTML = `
         <div style="color: #9e9e9e; margin-bottom: 8px;">
           <div style="font-size: 24px; margin-bottom: 4px;">🖼️</div>
-          <div style="font-size: 12px;">暂无一图总结</div>
+          <div style="font-size: 12px;">${getString("itempane-no-image-summary")}</div>
         </div>
       `;
       imageContainer.appendChild(generateImageBtn);
@@ -4945,14 +6765,14 @@ async function loadImageSummary(
     const imgSrc = await ImageNoteGenerator.getImageFromNote(imageNote);
 
     if (!imgSrc) {
-      imageContainer.innerHTML = `<div style="color: #9e9e9e; font-size: 12px;">笔记中未找到图片</div>`;
+      imageContainer.innerHTML = `<div style="color: #9e9e9e; font-size: 12px;">${getString("itempane-image-not-found")}</div>`;
       return;
     }
 
     // 创建图片元素
     const imgElement = doc.createElement("img");
     imgElement.src = imgSrc;
-    imgElement.alt = "一图总结";
+    imgElement.alt = getString("itempane-image-title");
     imgElement.style.cssText = `
       width: 100%;
       max-width: 100%;
@@ -4983,7 +6803,7 @@ async function loadImageSummary(
     // 放大按钮
     const zoomBtn = doc.createElement("button");
     zoomBtn.textContent = "🔍";
-    zoomBtn.title = "放大查看";
+    zoomBtn.title = getString("itempane-zoom-image");
     zoomBtn.style.cssText = `
       padding: 4px 8px;
       border: 1px solid #9c27b0;
@@ -4999,7 +6819,7 @@ async function loadImageSummary(
     // 下载按钮
     const downloadBtn = doc.createElement("button");
     downloadBtn.textContent = "⬇️";
-    downloadBtn.title = "下载图片";
+    downloadBtn.title = getString("itempane-download-image");
     downloadBtn.style.cssText = `
       padding: 4px 8px;
       border: 1px solid #9c27b0;
@@ -5020,7 +6840,7 @@ async function loadImageSummary(
           const ext = mimeExt === "jpeg" ? "jpg" : mimeExt;
 
           const desktopDir = Services.dirsvc.get("Desk", Ci.nsIFile);
-          const filename = `AI管家_一图总结_${targetItem
+          const filename = `${getString("itempane-image-summary-filename-prefix")}_${targetItem
             .getField("title")
             .substring(0, 30)
             .replace(/[\\/:*?"<>|]/g, "_")}.${ext}`;
@@ -5039,7 +6859,9 @@ async function loadImageSummary(
             closeTime: 3000,
           })
             .createLine({
-              text: `图片已保存到桌面: ${filename}`,
+              text: getString("itempane-image-saved-desktop", {
+                args: { filename },
+              }),
               type: "success",
             })
             .show();
@@ -5048,7 +6870,10 @@ async function loadImageSummary(
             closeOnClick: true,
             closeTime: 3000,
           })
-            .createLine({ text: "仅支持 data URI 格式的图片", type: "error" })
+            .createLine({
+              text: getString("itempane-data-uri-only"),
+              type: "error",
+            })
             .show();
         }
       } catch (err: any) {
@@ -5057,7 +6882,12 @@ async function loadImageSummary(
           closeOnClick: true,
           closeTime: 3000,
         })
-          .createLine({ text: `下载失败: ${err.message}`, type: "error" })
+          .createLine({
+            text: getString("itempane-download-failed", {
+              args: { error: err.message },
+            }),
+            type: "error",
+          })
           .show();
       }
     });
@@ -5066,7 +6896,7 @@ async function loadImageSummary(
     // 打开文件夹按钮
     const openFolderBtn = doc.createElement("button");
     openFolderBtn.textContent = "📂";
-    openFolderBtn.title = "打开图片所在文件夹";
+    openFolderBtn.title = getString("itempane-open-image-folder");
     openFolderBtn.style.cssText = `
       padding: 4px 8px;
       border: 1px solid #9c27b0;
@@ -5091,14 +6921,20 @@ async function loadImageSummary(
               closeOnClick: true,
               closeTime: 2000,
             })
-              .createLine({ text: "已打开图片所在文件夹", type: "success" })
+              .createLine({
+                text: getString("itempane-folder-opened"),
+                type: "success",
+              })
               .show();
           } else {
             new ztoolkit.ProgressWindow("AI Butler", {
               closeOnClick: true,
               closeTime: 3000,
             })
-              .createLine({ text: "图片文件不存在", type: "error" })
+              .createLine({
+                text: getString("itempane-image-file-missing"),
+                type: "error",
+              })
               .show();
           }
         } else {
@@ -5107,7 +6943,7 @@ async function loadImageSummary(
             closeTime: 3000,
           })
             .createLine({
-              text: "未找到图片附件（可能是旧版内嵌图片）",
+              text: getString("itempane-image-attachment-missing"),
               type: "error",
             })
             .show();
@@ -5118,7 +6954,12 @@ async function loadImageSummary(
           closeOnClick: true,
           closeTime: 3000,
         })
-          .createLine({ text: `打开失败: ${err.message}`, type: "error" })
+          .createLine({
+            text: getString("itempane-open-failed", {
+              args: { error: err.message },
+            }),
+            type: "error",
+          })
           .show();
       }
     });
@@ -5128,7 +6969,7 @@ async function loadImageSummary(
     imageContainer.appendChild(imgElement);
   } catch (err: any) {
     ztoolkit.log("[AI-Butler] 加载一图总结失败:", err);
-    imageContainer.innerHTML = `<div style="color: #d32f2f; font-size: 12px;">加载失败: ${err.message}</div>`;
+    imageContainer.innerHTML = `<div style="color: #d32f2f; font-size: 12px;">${getString("itempane-load-failed", { args: { error: err.message } })}</div>`;
   }
 }
 
@@ -5142,7 +6983,7 @@ async function openImageSummaryViewerWindow(
       : (globalThis as any);
 
   if (typeof mainWin?.openDialog !== "function") {
-    throw new Error("openDialog not available");
+    throw new Error(getString("itempane-error-open-dialog-unavailable"));
   }
 
   let itemTitle = "";
@@ -5161,7 +7002,11 @@ async function openImageSummaryViewerWindow(
     ? Math.max(600, Math.floor(screenObj.availHeight * 0.95))
     : 800;
 
-  const title = itemTitle ? `一图总结 - ${itemTitle}` : "一图总结";
+  const title = itemTitle
+    ? getString("itempane-image-summary-title-with-item", {
+        args: { title: itemTitle },
+      })
+    : getString("itempane-image-summary-title");
   const viewerURL = `chrome://${config.addonRef}/content/imageSummaryViewer.html`;
 
   const dialogWin: any = mainWin.openDialog(
@@ -5172,7 +7017,7 @@ async function openImageSummaryViewerWindow(
   );
 
   if (!dialogWin) {
-    throw new Error("Failed to open viewer window");
+    throw new Error(getString("itempane-error-viewer-window-failed"));
   }
 
   // Extra fallback channel in case window.arguments isn't available for some reason
@@ -5200,7 +7045,7 @@ async function openMindmapViewerWindow(
       : (globalThis as any);
 
   if (typeof mainWin?.openDialog !== "function") {
-    throw new Error("openDialog not available");
+    throw new Error(getString("itempane-error-open-dialog-unavailable"));
   }
 
   let itemTitle = "";
@@ -5220,7 +7065,11 @@ async function openMindmapViewerWindow(
     width = Math.min(width, Math.floor(screenObj.availWidth * 0.9));
   }
 
-  const title = itemTitle ? `思维导图 - ${itemTitle}` : "思维导图";
+  const title = itemTitle
+    ? getString("itempane-mindmap-title-with-item", {
+        args: { title: itemTitle },
+      })
+    : getString("itempane-mindmap-title");
   const viewerURL = `chrome://${config.addonRef}/content/mindmapViewer.html`;
 
   const dialogWin: any = mainWin.openDialog(
@@ -5235,7 +7084,7 @@ async function openMindmapViewerWindow(
   );
 
   if (!dialogWin) {
-    throw new Error("Failed to open viewer window");
+    throw new Error(getString("itempane-error-viewer-window-failed"));
   }
 
   // Extra fallback channel in case window.arguments isn't available for some reason
@@ -5272,7 +7121,7 @@ function openImageOverlayFallback(doc: Document, imageDataUri: string): void {
 
   const fullImg = doc.createElement("img");
   fullImg.src = imageDataUri;
-  fullImg.alt = "一图总结";
+  fullImg.alt = getString("image-note-poster-alt");
   fullImg.style.cssText = `
     max-width: 95%;
     max-height: 95%;
@@ -5550,7 +7399,7 @@ async function copyToClipboard(doc: Document, text: string): Promise<void> {
 
     // 回退方案：使用 execCommand
     if (!doc.body) {
-      throw new Error("Document body not available");
+      throw new Error(getString("itempane-error-document-body-unavailable"));
     }
     const textArea = doc.createElement("textarea");
     textArea.value = text;

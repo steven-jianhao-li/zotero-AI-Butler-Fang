@@ -63,6 +63,7 @@ import {
   PROMPT_VERSION,
   shouldUpdatePrompt,
 } from "./utils/prompts";
+import { maybeOpenOnboardingTutorialOnStartup } from "./modules/onboarding";
 
 /**
  * 插件启动钩子函数
@@ -124,6 +125,8 @@ async function onStartup() {
   // 标记插件初始化完成
   // 某些功能依赖此标志来判断插件是否已准备好
   addon.data.initialized = true;
+
+  void maybeOpenOnboardingTutorialOnStartup();
 }
 
 /**
@@ -151,6 +154,9 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
 
   // 注入插件主窗口的国际化资源
   win.MozXULElement.insertFTLIfNeeded(
+    `${addon.data.config.addonRef}-addon.ftl`,
+  );
+  win.MozXULElement.insertFTLIfNeeded(
     `${addon.data.config.addonRef}-mainWindow.ftl`,
   );
 
@@ -162,7 +168,7 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
 
   // 注册右键上下文菜单
   // 为用户提供快速访问插件功能的入口
-  registerContextMenuItem();
+  registerContextMenuItem(win);
   bindUICustomizationRefreshEvent(win);
 
   // 注册文献库工具栏按钮
@@ -266,7 +272,8 @@ function initializeDefaultPrefsOnStartup() {
     failedKeyCooldown: "300000", // 失败密钥冷却时间(毫秒)，默认5分钟
     temperature: "0.7", // 默认温度参数,平衡创造性和准确性
     reasoningEffort: "default",
-    stream: true, // 默认启用流式输出,提供更好的用户体验
+    stream: true,
+    promptLanguage: "auto", // 默认提示词语言跟随 Zotero 界面语言
     summaryPrompt: getDefaultSummaryPrompt(), // 加载默认提示词模板
     promptVersion: PROMPT_VERSION, // 当前提示词版本号
     contextMenuCollapsed: DEFAULT_CONTEXT_MENU_COLLAPSED,
@@ -285,6 +292,7 @@ function initializeDefaultPrefsOnStartup() {
       '{"summaryDocx":true,"deepReadDocx":true,"summaryMd":true,"deepReadMd":true}',
     noteExportConflictStrategy: "skip",
     noteExportSuppressDirectoryPrompt: false,
+    onboardingTutorialSeenVersion: "",
   };
 
   // 遍历所有配置项,确保每项都有有效值
@@ -296,8 +304,7 @@ function initializeDefaultPrefsOnStartup() {
       // 特殊处理:检查提示词是否需要升级
       if (key === "summaryPrompt") {
         const currentPromptVersion = getPref("promptVersion" as any) as
-          | number
-          | undefined;
+          number | undefined;
         const currentPrompt = currentValue as string | undefined;
 
         // 如果提示词版本过时,自动升级到最新版本
@@ -373,16 +380,116 @@ const CONTEXT_MENU_ROOT_DOM_IDS: Record<ContextMenuScope, string> = {
   collection: "zotero-collectionmenu-ai-butler-root",
 };
 
-function unregisterContextMenuItems(menu: {
-  unregister?: (menuId: string) => void;
-}): void {
-  if (typeof menu.unregister !== "function") return;
+const CONTEXT_MENU_POPUP_IDS: Record<ContextMenuScope, string[]> = {
+  item: ["zotero-itemmenu"],
+  collection: ["zotero-collectionmenu"],
+};
+
+function getContextMenuPopup(
+  doc: Document,
+  scope: ContextMenuScope,
+): XUL.MenuPopup | null {
+  for (const id of CONTEXT_MENU_POPUP_IDS[scope]) {
+    const popup = doc.getElementById(id) as XUL.MenuPopup | null;
+    if (popup) return popup;
+  }
+  return null;
+}
+
+function unregisterContextMenuItems(doc: Document): void {
   for (const menuId of Object.values(CONTEXT_MENU_ROOT_DOM_IDS)) {
-    menu.unregister(menuId);
+    doc.getElementById(menuId)?.remove();
   }
   for (const item of CONTEXT_MENU_ITEMS) {
-    menu.unregister(CONTEXT_MENU_DOM_IDS[item.id]);
+    doc.getElementById(CONTEXT_MENU_DOM_IDS[item.id])?.remove();
   }
+}
+
+function setContextMenuElementVisibility(
+  element: Element,
+  visible: boolean,
+): void {
+  if (visible) {
+    element.removeAttribute("hidden");
+  } else {
+    element.setAttribute("hidden", "true");
+  }
+}
+
+function bindContextMenuVisibilityUpdater(popup: Element): void {
+  const flagKey = "__aiButlerContextMenuVisibilityBound";
+  if ((popup as any)[flagKey]) return;
+  (popup as any)[flagKey] = true;
+
+  popup.addEventListener("popupshowing", (event: Event) => {
+    const root = event.currentTarget as Element;
+    const candidates = Array.from(
+      root.querySelectorAll("[data-ai-butler-context-menu='true']"),
+    ) as Element[];
+    for (const element of candidates) {
+      const getVisibility = (element as any).__aiButlerGetVisibility as
+        | ((element: Element, event: Event) => boolean | Promise<boolean>)
+        | undefined;
+      if (!getVisibility) continue;
+      void Promise.resolve(getVisibility(element, event)).then(
+        (visible) =>
+          setContextMenuElementVisibility(element, visible !== false),
+        (error) => {
+          ztoolkit.log("[AI-Butler] 更新右键菜单可见性失败:", error);
+          setContextMenuElementVisibility(element, false);
+        },
+      );
+    }
+  });
+}
+
+function createContextMenuElement(doc: Document, options: any): XULElement {
+  const tag = options.tag === "menu" ? "menu" : "menuitem";
+  const element = doc.createXULElement(tag) as XULElement;
+  element.setAttribute("id", options.id);
+  element.setAttribute("label", options.label);
+  element.setAttribute("data-ai-butler-context-menu", "true");
+
+  if (options.icon) {
+    element.setAttribute("image", options.icon);
+    element.setAttribute(
+      "class",
+      tag === "menu" ? "menu-iconic" : "menuitem-iconic",
+    );
+  }
+
+  if (typeof options.commandListener === "function") {
+    element.addEventListener("command", options.commandListener);
+  }
+
+  if (typeof options.getVisibility === "function") {
+    (element as any).__aiButlerGetVisibility = options.getVisibility;
+  }
+
+  if (tag === "menu") {
+    const popup = doc.createXULElement("menupopup") as XUL.MenuPopup;
+    bindContextMenuVisibilityUpdater(popup);
+    for (const child of options.children || []) {
+      popup.appendChild(createContextMenuElement(doc, child));
+    }
+    element.appendChild(popup);
+  }
+
+  return element;
+}
+
+function registerContextMenuElement(
+  doc: Document,
+  scope: ContextMenuScope,
+  options: any,
+): void {
+  const popup = getContextMenuPopup(doc, scope);
+  if (!popup) {
+    ztoolkit.log(`[AI-Butler] 找不到 ${scope} 右键菜单容器`);
+    return;
+  }
+  bindContextMenuVisibilityUpdater(popup);
+  popup.appendChild(createContextMenuElement(doc, options));
 }
 
 async function isContextMenuOptionVisible(
@@ -526,7 +633,7 @@ function createModalShell(title: string): {
 
   const parent = doc.body || doc.documentElement;
   if (!parent) {
-    throw new Error("无法创建确认对话框");
+    throw new Error(getString("dialog-error-create-confirmation-failed"));
   }
   parent.appendChild(overlay);
 
@@ -582,48 +689,84 @@ function isRegeneratableDialogType(
   );
 }
 
+function getCleanTypeLabel(type: CleanableAiNoteType): string {
+  return CollectionAiNoteCleaner.getTypeLabel(type);
+}
+
+function formatLocalizedList(parts: string[]): string {
+  return parts.join(getString("collection-clean-list-separator"));
+}
+
 function formatCleanScope(plan: CollectionAiNoteCleanPlan): string {
   if (plan.scope === "summary") {
-    return "仅清空 AI 管家AI 总结";
+    return getString("collection-clean-scope-summary");
   }
 
   return plan.includeChat
-    ? "清空AI管家所有笔记，并同时清空后续追问记录"
-    : "清空AI管家所有笔记（含 AI 总结、AI 精读、一图总结、思维导图、填表)";
+    ? getString("collection-clean-scope-all-with-chat")
+    : getString("collection-clean-scope-all");
 }
 
 function formatPlanTypeCounts(plan: CollectionAiNoteCleanPlan): string {
-  const labels = CollectionAiNoteCleaner.TYPE_LABELS;
-  return (Object.keys(labels) as CleanableAiNoteType[])
+  const parts = (Object.keys(plan.counts) as CleanableAiNoteType[])
     .filter((type) => plan.counts[type] > 0)
-    .map((type) => `${plan.counts[type]} 条${labels[type]}`)
-    .join("、");
+    .map((type) =>
+      getString("collection-clean-plan-type-count", {
+        args: { count: plan.counts[type], type: getCleanTypeLabel(type) },
+      }),
+    );
+  return formatLocalizedList(parts);
 }
 
 function formatRegenerationCounts(plan: CollectionAiNoteCleanPlan): string {
   const counts = getRegenerationCounts(plan);
   const parts = [
-    counts.summary > 0 ? `${counts.summary} 篇论文重新精读` : "",
-    counts.imageSummary > 0 ? `${counts.imageSummary} 个一图总结` : "",
-    counts.mindmap > 0 ? `${counts.mindmap} 个思维导图` : "",
-    counts.tableFill > 0 ? `${counts.tableFill} 个填表任务` : "",
+    counts.summary > 0
+      ? getString("collection-clean-regen-summary-count", {
+          args: { count: counts.summary },
+        })
+      : "",
+    counts.imageSummary > 0
+      ? getString("collection-clean-regen-image-count", {
+          args: { count: counts.imageSummary },
+        })
+      : "",
+    counts.mindmap > 0
+      ? getString("collection-clean-regen-mindmap-count", {
+          args: { count: counts.mindmap },
+        })
+      : "",
+    counts.tableFill > 0
+      ? getString("collection-clean-regen-table-count", {
+          args: { count: counts.tableFill },
+        })
+      : "",
   ].filter(Boolean);
 
-  return parts.length > 0 ? parts.join("、") : "无可重新生成任务";
+  return parts.length > 0
+    ? formatLocalizedList(parts)
+    : getString("collection-clean-regen-none");
 }
 
 function formatNonRegeneratableCleanCounts(
   plan: CollectionAiNoteCleanPlan,
 ): string {
   const chatCount = plan.counts.chat || 0;
-  return chatCount > 0 ? `${chatCount} 条后续追问记录不会重新生成。` : "";
+  return chatCount > 0
+    ? getString("collection-clean-chat-not-regenerated", {
+        args: { count: chatCount },
+      })
+    : "";
 }
 
 function buildPlanExamples(plan: CollectionAiNoteCleanPlan): string[] {
-  const labels = CollectionAiNoteCleaner.TYPE_LABELS;
   return plan.itemPlans.slice(0, 3).map((itemPlan) => {
-    const typeText = itemPlan.types.map((type) => labels[type]).join("、");
-    return `${truncateForDialog(itemPlan.itemTitle)}：${typeText}`;
+    const typeText = formatLocalizedList(
+      itemPlan.types.map((type) => getCleanTypeLabel(type)),
+    );
+    return getString("collection-clean-plan-example", {
+      args: { title: truncateForDialog(itemPlan.itemTitle), types: typeText },
+    });
   });
 }
 
@@ -633,8 +776,9 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
   action: CollectionAiNoteCleanAction;
 } | null> {
   return new Promise((resolve) => {
-    const { doc, overlay, body, actions, close } =
-      createModalShell("清空分类 AI 管家笔记");
+    const { doc, overlay, body, actions, close } = createModalShell(
+      getString("collection-clean-dialog-title"),
+    );
     let settled = false;
     const finish = (
       value: {
@@ -650,7 +794,9 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
     };
 
     const message = doc.createElement("div");
-    message.textContent = `将处理分类「${collectionName}」及其子分类中的文献。请选择清空范围和操作。`;
+    message.textContent = getString("collection-clean-choice-message", {
+      args: { collection: collectionName },
+    });
     Object.assign(message.style, {
       color: "var(--ai-text-muted, #555)",
       lineHeight: "1.6",
@@ -670,12 +816,12 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
     }> = [
       {
         value: "summary",
-        label: "只清空 AI 管家的 AI 总结",
+        label: getString("collection-clean-option-summary-title"),
         checked: true,
       },
       {
         value: "all",
-        label: "清空AI管家所有笔记（含AI 总结、一图总结、思维导图、填表)",
+        label: getString("collection-clean-option-all-title"),
         checked: false,
       },
     ];
@@ -716,8 +862,8 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
       const desc = doc.createElement("div");
       desc.textContent =
         option.value === "summary"
-          ? "只删除常规AI 总结，并清空对应总结任务。"
-          : "删除 AI 总结、AI 精读、一图总结、思维导图、填表；旧后续追问记录需单独勾选。";
+          ? getString("collection-clean-option-summary-description")
+          : getString("collection-clean-option-all-description");
       Object.assign(desc.style, {
         marginTop: "3px",
         fontSize: "12px",
@@ -756,14 +902,13 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
     });
     const chatText = doc.createElement("div");
     const chatTitle = doc.createElement("div");
-    chatTitle.textContent = "同时清空后续追问记录（无法重新生成）";
+    chatTitle.textContent = getString("collection-clean-chat-title");
     Object.assign(chatTitle.style, {
       fontWeight: "650",
       color: "var(--ai-text, #222)",
     });
     const chatDesc = doc.createElement("div");
-    chatDesc.textContent =
-      "后续追问是历史对话记录，清空后不会加入重新生成队列。";
+    chatDesc.textContent = getString("collection-clean-chat-description");
     Object.assign(chatDesc.style, {
       marginTop: "3px",
       fontSize: "12px",
@@ -776,9 +921,21 @@ function showCollectionCleanChoiceDialog(collectionName: string): Promise<{
     chatRow.appendChild(chatText);
     body.appendChild(chatRow);
 
-    const cancelBtn = createModalButton(doc, "取消", "#8a8f98");
-    const confirmBtn = createModalButton(doc, "确认", "#d97706");
-    const regenBtn = createModalButton(doc, "清空并重新生成", "#c2410c");
+    const cancelBtn = createModalButton(
+      doc,
+      getString("dialog-button-cancel"),
+      "#8a8f98",
+    );
+    const confirmBtn = createModalButton(
+      doc,
+      getString("dialog-button-confirm"),
+      "#d97706",
+    );
+    const regenBtn = createModalButton(
+      doc,
+      getString("collection-clean-button-delete-and-regenerate"),
+      "#c2410c",
+    );
     actions.appendChild(cancelBtn);
     actions.appendChild(confirmBtn);
     actions.appendChild(regenBtn);
@@ -866,7 +1023,7 @@ function showDelayedConfirmDialog(params: {
     body.appendChild(list);
 
     const warning = doc.createElement("div");
-    warning.textContent = "该操作不可逆，请确认已经理解后再继续。";
+    warning.textContent = getString("dialog-warning-irreversible");
     Object.assign(warning.style, {
       padding: "9px 10px",
       borderRadius: "6px",
@@ -876,7 +1033,11 @@ function showDelayedConfirmDialog(params: {
     });
     body.appendChild(warning);
 
-    const cancelBtn = createModalButton(doc, "取消", "#8a8f98");
+    const cancelBtn = createModalButton(
+      doc,
+      getString("dialog-button-cancel"),
+      "#8a8f98",
+    );
     const confirmBtn = createModalButton(
       doc,
       `${params.confirmLabel} (1)`,
@@ -915,9 +1076,17 @@ function buildFinalConfirmDetails(
   action: CollectionAiNoteCleanAction,
 ): string[] {
   const details = [
-    `范围：${formatCleanScope(plan)}。`,
-    `已扫描 ${plan.scannedItemCount} 篇文献，发现 ${getPlanTotalNotes(plan)} 条笔记：${formatPlanTypeCounts(plan)}。`,
-    "会同步清空这些文献对应类型的旧队列任务。",
+    getString("collection-clean-confirm-detail-scope", {
+      args: { scope: formatCleanScope(plan) },
+    }),
+    getString("collection-clean-confirm-detail-found", {
+      args: {
+        scanned: plan.scannedItemCount,
+        notes: getPlanTotalNotes(plan),
+        counts: formatPlanTypeCounts(plan),
+      },
+    }),
+    getString("collection-clean-confirm-detail-clear-queue"),
   ];
   const nonRegeneratableText = formatNonRegeneratableCleanCounts(plan);
   if (nonRegeneratableText) {
@@ -925,13 +1094,25 @@ function buildFinalConfirmDetails(
   }
 
   if (action === "deleteAndRegenerate") {
-    details.push(`随后加入普通队列：${formatRegenerationCounts(plan)}。`);
-    details.push("重新生成可能产生较大的 token 和 API 调用消耗。");
+    details.push(
+      getString("collection-clean-confirm-detail-regenerate", {
+        args: { counts: formatRegenerationCounts(plan) },
+      }),
+    );
+    details.push(getString("collection-clean-confirm-detail-token-cost"));
   }
 
   const examples = buildPlanExamples(plan);
   if (examples.length > 0) {
-    details.push(`示例：${examples.join("；")}。`);
+    details.push(
+      getString("collection-clean-confirm-detail-examples", {
+        args: {
+          examples: examples.join(
+            getString("collection-clean-example-separator"),
+          ),
+        },
+      }),
+    );
   }
 
   return details;
@@ -963,22 +1144,21 @@ async function maybeOpenTaskPanelAfterQueue(): Promise<void> {
  * - 视觉样式:显示插件图标和国际化文本
  *
  * 技术实现:
- * - 使用 ztoolkit.Menu API 注册菜单项
+ * - 使用 Zotero/XUL 原生菜单注册菜单项
  * - getVisibility 动态控制菜单项的显示状态
  * - commandListener 处理用户点击事件
  */
-function registerContextMenuItem() {
+function registerContextMenuItem(win?: Window) {
   // 获取插件图标路径,用于菜单项显示
   const menuIcon = `chrome://${config.addonRef}/content/icons/favicon.png`;
-  const menu = (ztoolkit as any).Menu as {
-    register: (scope: ContextMenuScope, options: any) => void;
-    unregister?: (menuId: string) => void;
-  };
-
-  unregisterContextMenuItems(menu);
+  const targetWindows = win ? [win] : Zotero.getMainWindows();
+  for (const targetWin of targetWindows) {
+    unregisterContextMenuItems(targetWin.document);
+  }
 
   const isRegularItemSelection = () => {
-    const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
+    const selectedItems =
+      Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
     return (
       selectedItems?.every((item: Zotero.Item) => item.isRegularItem()) || false
     );
@@ -1005,7 +1185,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.multiRoundReanalyze,
-        label: getString("menuitem-multiRoundReanalyze" as any),
+        label: getString("menuitem-multiRoundReanalyze"),
         icon: menuIcon,
         commandListener: () => handleMultiRoundSummary(),
         getVisibility: () =>
@@ -1018,7 +1198,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.dashboard,
-        label: "AI 管家仪表盘",
+        label: getString("menuitem-dashboard"),
         icon: menuIcon,
         commandListener: async (_ev: Event) => {
           await openAIButlerDashboardFromUnifiedEntry();
@@ -1045,7 +1225,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.mindmap,
-        label: getString("menuitem-mindmap" as any),
+        label: getString("menuitem-mindmap"),
         icon: menuIcon,
         commandListener: async () => {
           await handleMindmapGeneration();
@@ -1062,7 +1242,8 @@ function registerContextMenuItem() {
         label: getString("menuitem-chatWithAI"),
         icon: menuIcon,
         commandListener: async () => {
-          const selectedItems = Zotero.getActiveZoteroPane().getSelectedItems();
+          const selectedItems =
+            Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
           const item = selectedItems?.[0];
           if (item?.isRegularItem()) {
             await handleOpenAIChat(item.id);
@@ -1070,7 +1251,8 @@ function registerContextMenuItem() {
         },
         getVisibility: () =>
           isContextMenuItemEnabled("chatWithAI") &&
-          Zotero.getActiveZoteroPane().getSelectedItems()?.length === 1 &&
+          (Zotero.getActiveZoteroPane()?.getSelectedItems() ?? []).length ===
+            1 &&
           isRegularItemSelection(),
       },
     },
@@ -1079,7 +1261,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.literatureReview,
-        label: getString("menuitem-literatureReview" as any),
+        label: getString("menuitem-literatureReview"),
         icon: menuIcon,
         commandListener: async () => {
           await handleLiteratureReview();
@@ -1092,7 +1274,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.clearCollectionAiNotes,
-        label: getString("menuitem-clearCollectionAiNotes" as any),
+        label: getString("menuitem-clearCollectionAiNotes"),
         icon: menuIcon,
         commandListener: async () => {
           await handleClearCollectionAiNotes();
@@ -1105,7 +1287,7 @@ function registerContextMenuItem() {
       options: {
         tag: "menuitem",
         id: CONTEXT_MENU_DOM_IDS.exportCollectionNotes,
-        label: "导出该分类 AI 笔记",
+        label: getString("collection-export-menuitem"),
         icon: menuIcon,
         commandListener: async () => {
           await handleExportCollectionNotes();
@@ -1128,25 +1310,33 @@ function registerContextMenuItem() {
         .map((definition) => definition.options);
       if (!children.length) continue;
 
-      menu.register(scope, {
-        tag: "menu",
-        id: CONTEXT_MENU_ROOT_DOM_IDS[scope],
-        label: "AI 管家",
-        icon: menuIcon,
-        children,
-        getVisibility: async (_elem: XUL.Menu, ev: Event) => {
-          for (const child of children) {
-            if (await isContextMenuOptionVisible(child, ev)) return true;
-          }
-          return false;
-        },
-      });
+      for (const targetWin of targetWindows) {
+        registerContextMenuElement(targetWin.document, scope, {
+          tag: "menu",
+          id: CONTEXT_MENU_ROOT_DOM_IDS[scope],
+          label: getString("menu-root-ai-butler"),
+          icon: menuIcon,
+          children,
+          getVisibility: async (_elem: XUL.Menu, ev: Event) => {
+            for (const child of children) {
+              if (await isContextMenuOptionVisible(child, ev)) return true;
+            }
+            return false;
+          },
+        });
+      }
     }
     return;
   }
 
   for (const definition of orderedDefinitions) {
-    menu.register(definition.scope, definition.options);
+    for (const targetWin of targetWindows) {
+      registerContextMenuElement(
+        targetWin.document,
+        definition.scope,
+        definition.options,
+      );
+    }
   }
 }
 
@@ -1191,14 +1381,12 @@ function registerLibraryToolbarButton(win: Window) {
 
     // 创建按钮
     const button = doc.createXULElement("toolbarbutton") as XULElement;
-    button.setAttribute("label", "🤖");
-    button.setAttribute(
-      "tooltiptext",
-      getString("library-toolbar-ai-butler" as any),
-    );
+    const iconURI = `chrome://${config.addonRef}/content/icons/icon24.png`;
+    button.setAttribute("image", iconURI);
+    button.setAttribute("tooltiptext", getString("library-toolbar-ai-butler"));
     button.setAttribute("class", "zotero-tb-button");
     (button as any).style.cssText = `
-      font-size: 16px;
+      list-style-image: url("${iconURI}");
       cursor: pointer;
     `;
 
@@ -1213,7 +1401,9 @@ function registerLibraryToolbarButton(win: Window) {
           closeTime: 3000,
         })
           .createLine({
-            text: `打开失败: ${error.message || error}`,
+            text: getString("reader-toolbar-error-open-failed", {
+              args: { error: error.message || error },
+            }),
             type: "error",
           })
           .show();
@@ -1260,9 +1450,9 @@ function registerReaderToolbarButton() {
 
     // 创建按钮 - 使用图标而非文字以适应窄工具栏
     const button = doc.createElement("button");
+    const iconURI = `chrome://${config.addonRef}/content/icons/icon24.png`;
     button.className = "toolbar-button ai-butler-reader-chat-btn";
-    button.innerHTML = `🤖`;
-    button.title = "AI 管家 - 与 AI 对话讨论当前论文";
+    button.title = getString("reader-toolbar-chat-title");
     button.style.cssText = `
       padding: 4px 8px;
       border: none;
@@ -1270,9 +1460,20 @@ function registerReaderToolbarButton() {
       background: transparent;
       color: inherit;
       cursor: pointer;
-      font-size: 16px;
       transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     `;
+    const icon = doc.createElement("img");
+    icon.src = iconURI;
+    icon.alt = "";
+    icon.style.cssText = `
+      width: 18px;
+      height: 18px;
+      display: block;
+    `;
+    button.appendChild(icon);
 
     // 悬停效果
     button.addEventListener("mouseenter", () => {
@@ -1292,7 +1493,7 @@ function registerReaderToolbarButton() {
             closeTime: 3000,
           })
             .createLine({
-              text: "无法获取当前文献信息",
+              text: getString("reader-toolbar-error-no-item"),
               type: "error",
             })
             .show();
@@ -1311,7 +1512,7 @@ function registerReaderToolbarButton() {
               closeTime: 3000,
             })
               .createLine({
-                text: "该 PDF 没有关联的父条目",
+                text: getString("reader-toolbar-error-no-parent"),
                 type: "error",
               })
               .show();
@@ -1331,7 +1532,9 @@ function registerReaderToolbarButton() {
           closeTime: 3000,
         })
           .createLine({
-            text: `打开失败: ${error.message || error}`,
+            text: getString("reader-toolbar-error-open-failed", {
+              args: { error: error.message || error },
+            }),
             type: "error",
           })
           .show();
@@ -1435,7 +1638,9 @@ async function handleOpenAIChat(itemId: number): Promise<void> {
       closeTime: 3000,
     })
       .createLine({
-        text: `打开 AI 追问失败: ${error.message || error}`,
+        text: getString("chat-open-error", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -1486,19 +1691,29 @@ async function handleGenerateSummary() {
         ? enabledEndpoints
             .map((endpoint) => {
               const missing = LLMEndpointManager.validateEndpoint(endpoint);
-              return `${endpoint.name} (${LLMEndpointManager.providerLabel(
-                endpoint.providerType,
-              )}) 缺少: ${missing.join(", ") || "未知配置"}`;
+              return getString("summary-endpoint-missing-line", {
+                args: {
+                  name: endpoint.name,
+                  provider: LLMEndpointManager.providerLabel(
+                    endpoint.providerType,
+                  ),
+                  missing:
+                    missing.join(", ") ||
+                    getString("summary-endpoint-missing-unknown"),
+                },
+              });
             })
             .join("\n")
-        : "当前没有启用的 LLM Endpoint";
+        : getString("summary-endpoint-none-enabled");
     // API 未配置,显示友好的错误提示
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 5000, // 5秒后自动关闭
     })
       .createLine({
-        text: `请先在设置中配置至少一个可用的 LLM Endpoint\n${endpointDetails}`,
+        text: getString("summary-error-no-usable-endpoint", {
+          args: { details: endpointDetails },
+        }),
         type: "error",
       })
       .show();
@@ -1506,7 +1721,7 @@ async function handleGenerateSummary() {
   }
 
   // 第二步:获取用户选中的文献条目
-  const items = Zotero.getActiveZoteroPane().getSelectedItems();
+  const items = Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
 
   if (items.length === 0) {
     // 未选中任何条目,提示用户
@@ -1515,7 +1730,7 @@ async function handleGenerateSummary() {
       closeTime: 3000,
     })
       .createLine({
-        text: "请先选择要处理的条目",
+        text: getString("summary-error-no-items"),
         type: "error",
       })
       .show();
@@ -1537,8 +1752,10 @@ async function handleGenerateSummary() {
     progressWin
       .createLine({
         text: priority
-          ? "已加入优先队列: 1 篇文献，开始处理..."
-          : `已加入普通队列: ${items.length} 篇文献，将按批次设置处理`,
+          ? getString("summary-queue-priority-added")
+          : getString("summary-queue-normal-added", {
+              args: { count: items.length },
+            }),
         type: "success",
       })
       .show();
@@ -1546,7 +1763,9 @@ async function handleGenerateSummary() {
     ztoolkit.log("[AI-Butler] 入队失败:", error);
     progressWin
       .createLine({
-        text: `入队失败: ${error.message || error}`,
+        text: getString("summary-queue-failed", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -1698,13 +1917,16 @@ function onShortcuts(type: string) {
  */
 async function handleImageSummary() {
   // 1. 获取选中条目
-  const items = Zotero.getActiveZoteroPane().getSelectedItems();
+  const items = Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
   if (!items || items.length === 0) {
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请先选择要处理的文献", type: "error" })
+      .createLine({
+        text: getString("task-error-no-paper-selected"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -1716,7 +1938,10 @@ async function handleImageSummary() {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请选择一个文献条目", type: "error" })
+      .createLine({
+        text: getString("task-error-select-regular-item"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -1732,7 +1957,10 @@ async function handleImageSummary() {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "🖼️ 一图总结任务已加入队列", type: "success" })
+      .createLine({
+        text: getString("image-summary-queue-added"),
+        type: "success",
+      })
       .show();
   } catch (error: any) {
     ztoolkit.log("[AI-Butler] 添加一图总结任务失败:", error);
@@ -1741,7 +1969,9 @@ async function handleImageSummary() {
       closeTime: 5000,
     })
       .createLine({
-        text: `❌ 添加任务失败: ${error.message || error}`,
+        text: getString("task-queue-add-failed", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -1755,13 +1985,16 @@ async function handleImageSummary() {
  */
 async function handleMindmapGeneration() {
   // 1. 获取选中条目
-  const items = Zotero.getActiveZoteroPane().getSelectedItems();
+  const items = Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
   if (!items || items.length === 0) {
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请先选择要处理的文献", type: "error" })
+      .createLine({
+        text: getString("task-error-no-paper-selected"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -1773,7 +2006,10 @@ async function handleMindmapGeneration() {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请选择一个文献条目", type: "error" })
+      .createLine({
+        text: getString("task-error-select-regular-item"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -1789,7 +2025,10 @@ async function handleMindmapGeneration() {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "🧠 思维导图任务已加入队列", type: "success" })
+      .createLine({
+        text: getString("mindmap-queue-added"),
+        type: "success",
+      })
       .show();
   } catch (error: any) {
     ztoolkit.log("[AI-Butler] 添加思维导图任务失败:", error);
@@ -1798,7 +2037,9 @@ async function handleMindmapGeneration() {
       closeTime: 5000,
     })
       .createLine({
-        text: `❌ 添加任务失败: ${error.message || error}`,
+        text: getString("task-queue-add-failed", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -1816,7 +2057,7 @@ async function handleLiteratureReview() {
   try {
     // 获取当前选中的分类
     const zoteroPane = Zotero.getActiveZoteroPane();
-    const collection = zoteroPane.getSelectedCollection();
+    const collection = zoteroPane?.getSelectedCollection();
 
     if (!collection) {
       new ztoolkit.ProgressWindow("AI Butler", {
@@ -1824,7 +2065,7 @@ async function handleLiteratureReview() {
         closeTime: 3000,
       })
         .createLine({
-          text: "请先选择一个分类",
+          text: getString("collection-error-no-collection"),
           type: "error",
         })
         .show();
@@ -1847,7 +2088,9 @@ async function handleLiteratureReview() {
       closeTime: 5000,
     })
       .createLine({
-        text: `打开文献综述失败: ${error.message || error}`,
+        text: getString("literature-review-open-failed", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -1860,17 +2103,21 @@ async function handleLiteratureReview() {
 async function handleClearCollectionAiNotes() {
   try {
     const zoteroPane = Zotero.getActiveZoteroPane();
-    const collection = zoteroPane.getSelectedCollection();
+    const collection = zoteroPane?.getSelectedCollection();
 
     if (!collection) {
-      showAIButlerToast("请先选择一个分类", "error");
+      showAIButlerToast(getString("collection-error-no-collection"), "error");
       return;
     }
 
     const choice = await showCollectionCleanChoiceDialog(collection.name);
     if (!choice) return;
 
-    showAIButlerToast("正在扫描分类中的 AI 管家笔记...", "default", 1800);
+    showAIButlerToast(
+      getString("collection-clean-toast-scanning"),
+      "default",
+      1800,
+    );
     const plan = await CollectionAiNoteCleaner.inspectCollection(
       collection,
       choice.scope,
@@ -1879,7 +2126,9 @@ async function handleClearCollectionAiNotes() {
 
     if (plan.notes.length === 0) {
       showAIButlerToast(
-        `未在「${collection.name}」中找到符合范围的 AI 管家笔记`,
+        getString("collection-clean-toast-none-found", {
+          args: { collection: collection.name },
+        }),
         "warning",
         3500,
       );
@@ -1889,36 +2138,55 @@ async function handleClearCollectionAiNotes() {
     const confirmed = await showDelayedConfirmDialog({
       title:
         choice.action === "deleteAndRegenerate"
-          ? "确认清空并重新生成"
-          : "确认清空 AI 管家笔记",
+          ? getString("collection-clean-confirm-title-regenerate")
+          : getString("collection-clean-confirm-title-delete"),
       message:
         choice.action === "deleteAndRegenerate"
-          ? "将先删除已记录的 AI 管家笔记，再按删除前的笔记类型加入普通队列。"
-          : "将删除已记录的 AI 管家笔记。",
+          ? getString("collection-clean-confirm-message-regenerate")
+          : getString("collection-clean-confirm-message-delete"),
       details: buildFinalConfirmDetails(plan, choice.action),
       confirmLabel:
         choice.action === "deleteAndRegenerate"
-          ? "确认清空并重新生成"
-          : "确认清空",
+          ? getString("collection-clean-confirm-label-regenerate")
+          : getString("collection-clean-confirm-label-delete"),
     });
     if (!confirmed) return;
 
     const result = await CollectionAiNoteCleaner.applyPlan(plan, choice.action);
     const queuedText =
       choice.action === "deleteAndRegenerate"
-        ? `，已加入普通队列：${formatRegenerationCounts(plan)}`
+        ? getString("collection-clean-toast-queued", {
+            args: { counts: formatRegenerationCounts(plan) },
+          })
         : "";
     const failedText =
-      result.failedDeletes > 0 ? `，${result.failedDeletes} 条删除失败` : "";
+      result.failedDeletes > 0
+        ? getString("collection-clean-toast-failed-deletes", {
+            args: { count: result.failedDeletes },
+          })
+        : "";
 
     showAIButlerToast(
-      `已删除 ${result.deletedNotes} 条笔记，清理 ${result.clearedTasks} 个旧队列任务${queuedText}${failedText}`,
+      getString("collection-clean-toast-complete", {
+        args: {
+          deleted: result.deletedNotes,
+          tasks: result.clearedTasks,
+          queued: queuedText,
+          failed: failedText,
+        },
+      }),
       result.failedDeletes > 0 ? "warning" : "success",
       5200,
     );
   } catch (error: any) {
-    ztoolkit.log("[AI-Butler] 清空分类 AI 管家笔记失败:", error);
-    showAIButlerToast(`清空失败: ${error.message || error}`, "error", 5000);
+    ztoolkit.log("[AI-Butler] Failed to clear collection AI notes:", error);
+    showAIButlerToast(
+      getString("collection-clean-toast-failed", {
+        args: { error: error.message || error },
+      }),
+      "error",
+      5000,
+    );
   }
 }
 
@@ -1931,9 +2199,9 @@ type CollectionExportDialogChoice = {
 
 async function handleExportCollectionNotes() {
   try {
-    const collection = Zotero.getActiveZoteroPane().getSelectedCollection();
+    const collection = Zotero.getActiveZoteroPane()?.getSelectedCollection();
     if (!collection) {
-      showAIButlerToast("请先选择一个分类", "error");
+      showAIButlerToast(getString("collection-error-no-collection"), "error");
       return;
     }
 
@@ -1956,16 +2224,28 @@ async function handleExportCollectionNotes() {
       });
       if (choice.addToAutoWatch) {
         addWatchedCollection(collection.id);
-        showAIButlerToast("已加入自动导出监听分类", "success", 2200);
+        showAIButlerToast(
+          getString("collection-export-toast-auto-watch-added"),
+          "success",
+          2200,
+        );
       }
     }
 
-    const progressWindow = new ztoolkit.ProgressWindow("AI 笔记导出", {
-      closeOnClick: true,
-      closeTime: 6000,
-    });
+    const progressWindow = new ztoolkit.ProgressWindow(
+      getString("collection-export-progress-title"),
+      {
+        closeOnClick: true,
+        closeTime: 6000,
+      },
+    );
     progressWindow
-      .createLine({ text: `开始导出分类：${collection.name}`, type: "default" })
+      .createLine({
+        text: getString("collection-export-progress-start", {
+          args: { collection: collection.name },
+        }),
+        type: "default",
+      })
       .show();
 
     const result = await NoteExportService.exportCollection({
@@ -1976,7 +2256,15 @@ async function handleExportCollectionNotes() {
     });
 
     showAIButlerToast(
-      `导出完成：成功 ${result.exportedItems} 篇，跳过 ${result.skippedItems} 篇，失败 ${result.failedItems} 篇；写入 ${result.exportedFiles} 个文件，跳过 ${result.skippedFiles} 个文件`,
+      getString("collection-export-toast-complete", {
+        args: {
+          exportedItems: result.exportedItems,
+          skippedItems: result.skippedItems,
+          failedItems: result.failedItems,
+          exportedFiles: result.exportedFiles,
+          skippedFiles: result.skippedFiles,
+        },
+      }),
       result.failedItems > 0 ? "warning" : "success",
       7000,
     );
@@ -1986,16 +2274,30 @@ async function handleExportCollectionNotes() {
         result.warnings,
       );
       showAIButlerToast(
-        `导出详情：${result.warnings.slice(0, 2).join("；")}${
-          result.warnings.length > 2 ? "；更多详情见日志" : ""
-        }`,
+        getString("collection-export-toast-warnings", {
+          args: {
+            details: result.warnings
+              .slice(0, 2)
+              .join(getString("collection-clean-list-separator")),
+            more:
+              result.warnings.length > 2
+                ? getString("collection-export-toast-warnings-more")
+                : "",
+          },
+        }),
         "warning",
         9000,
       );
     }
   } catch (error: any) {
     ztoolkit.log("[AI-Butler] 分类 AI 笔记导出失败:", error);
-    showAIButlerToast(`导出失败：${error?.message || error}`, "error", 7000);
+    showAIButlerToast(
+      getString("collection-export-toast-failed", {
+        args: { error: error?.message || error },
+      }),
+      "error",
+      7000,
+    );
   }
 }
 
@@ -2007,7 +2309,7 @@ function showCollectionExportDialog(
   },
 ): Promise<CollectionExportDialogChoice | null> {
   return new Promise((resolve) => {
-    const shell = createModalShell("导出该分类 AI 笔记");
+    const shell = createModalShell(getString("collection-export-dialog-title"));
     const { doc, body, actions, close } = shell;
 
     Object.assign(body.style, {
@@ -2044,7 +2346,12 @@ function showCollectionExportDialog(
       flex: "0 0 auto",
     });
     const descriptionText = doc.createElement("div");
-    descriptionText.innerHTML = `将导出分类 <strong>“${escapeHtmlForDialog(collectionName)}”</strong> 及子分类中的论文附件、AI 总结和 AI 精读。`;
+    descriptionText.innerHTML = getString(
+      "collection-export-dialog-description",
+      {
+        args: { collection: escapeHtmlForDialog(collectionName) },
+      },
+    );
     Object.assign(descriptionText.style, {
       fontSize: "13px",
       lineHeight: "1.65",
@@ -2060,7 +2367,7 @@ function showCollectionExportDialog(
       gap: "8px",
     });
     const directoryLabel = doc.createElement("div");
-    directoryLabel.textContent = "导出目录";
+    directoryLabel.textContent = getString("collection-export-directory-label");
     Object.assign(directoryLabel.style, {
       fontSize: "12px",
       fontWeight: "700",
@@ -2076,7 +2383,9 @@ function showCollectionExportDialog(
     const pathInput = doc.createElement("input");
     pathInput.type = "text";
     pathInput.value = config.rootPath || "";
-    pathInput.placeholder = "选择或输入导出目录...";
+    pathInput.placeholder = getString(
+      "collection-export-directory-placeholder",
+    );
     Object.assign(pathInput.style, {
       flex: "1",
       minWidth: "0",
@@ -2099,7 +2408,11 @@ function showCollectionExportDialog(
       pathInput.style.borderColor = "#cbd5e1";
       pathInput.style.boxShadow = "inset 0 1px 2px rgba(15, 23, 42, 0.04)";
     });
-    const browseButton = createModalButton(doc, "选择目录", "#2563eb");
+    const browseButton = createModalButton(
+      doc,
+      getString("collection-export-button-browse"),
+      "#2563eb",
+    );
     Object.assign(browseButton.style, {
       height: "38px",
       boxSizing: "border-box",
@@ -2114,11 +2427,16 @@ function showCollectionExportDialog(
     });
     browseButton.addEventListener("click", async () => {
       try {
-        const selected = await pickFolderPath("选择 AI 笔记导出目录");
+        const selected = await pickFolderPath(
+          getString("collection-export-folder-picker-title"),
+        );
         if (selected) pathInput.value = selected;
       } catch (error) {
-        ztoolkit.log("[AI-Butler] 选择导出目录失败:", error);
-        showAIButlerToast("选择目录失败，请手动输入目录", "error");
+        ztoolkit.log("[AI-Butler] Failed to choose export directory:", error);
+        showAIButlerToast(
+          getString("collection-export-toast-browse-failed"),
+          "error",
+        );
       }
     });
     pathRow.appendChild(pathInput);
@@ -2138,14 +2456,14 @@ function showCollectionExportDialog(
     });
     const suppressLabel = createDialogCheckbox(
       doc,
-      "不再提醒，保持该目录（可在快捷设置 -> 自动导出中修改）",
+      getString("collection-export-option-suppress-directory-prompt"),
       false,
     );
     styleExportDialogCheckbox(suppressLabel.wrapper, suppressLabel.checkbox);
     optionsCard.appendChild(suppressLabel.wrapper);
     const watchLabel = createDialogCheckbox(
       doc,
-      "将该分类加入自动导出监听分类",
+      getString("collection-export-option-auto-watch"),
       false,
     );
     styleExportDialogCheckbox(watchLabel.wrapper, watchLabel.checkbox);
@@ -2164,7 +2482,7 @@ function showCollectionExportDialog(
       border: "1px solid #e5e7eb",
     });
     const strategyText = doc.createElement("div");
-    strategyText.textContent = "遇到已导出文件时";
+    strategyText.textContent = getString("collection-export-conflict-label");
     Object.assign(strategyText.style, {
       fontSize: "13px",
       color: "#334155",
@@ -2172,8 +2490,8 @@ function showCollectionExportDialog(
     });
     const strategySelect = doc.createElement("select");
     for (const [value, label] of [
-      ["skip", "跳过已有文件"],
-      ["overwrite", "覆盖已有文件"],
+      ["skip", getString("collection-export-conflict-skip")],
+      ["overwrite", getString("collection-export-conflict-overwrite")],
     ] as const) {
       const option = doc.createElement("option");
       option.value = value;
@@ -2198,7 +2516,11 @@ function showCollectionExportDialog(
     strategyCard.appendChild(strategySelect);
     body.appendChild(strategyCard);
 
-    const cancelButton = createModalButton(doc, "取消", "#9ca3af");
+    const cancelButton = createModalButton(
+      doc,
+      getString("dialog-button-cancel"),
+      "#9ca3af",
+    );
     Object.assign(cancelButton.style, {
       height: "32px",
       boxSizing: "border-box",
@@ -2215,7 +2537,11 @@ function showCollectionExportDialog(
       close();
       resolve(null);
     });
-    const confirmButton = createModalButton(doc, "开始导出", "#16a34a");
+    const confirmButton = createModalButton(
+      doc,
+      getString("collection-export-button-start"),
+      "#16a34a",
+    );
     Object.assign(confirmButton.style, {
       height: "32px",
       boxSizing: "border-box",
@@ -2232,7 +2558,10 @@ function showCollectionExportDialog(
     confirmButton.addEventListener("click", () => {
       const rootPath = pathInput.value.trim();
       if (!rootPath) {
-        showAIButlerToast("请先选择导出目录", "warning");
+        showAIButlerToast(
+          getString("collection-export-toast-directory-required"),
+          "warning",
+        );
         return;
       }
       close();
@@ -2307,18 +2636,24 @@ async function handleFillTable() {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "表格功能已在设置中关闭", type: "default" })
+      .createLine({
+        text: getString("table-fill-disabled"),
+        type: "default",
+      })
       .show();
     return;
   }
 
-  const items = Zotero.getActiveZoteroPane().getSelectedItems();
+  const items = Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
   if (!items || items.length === 0) {
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请先选择要填表的文献", type: "error" })
+      .createLine({
+        text: getString("table-fill-error-no-items"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -2346,7 +2681,9 @@ async function handleFillTable() {
       closeTime: 4000,
     })
       .createLine({
-        text: `📋 已加入队列: ${items.length} 篇文献填表任务`,
+        text: getString("table-fill-queue-added", {
+          args: { count: items.length },
+        }),
         type: "success",
       })
       .show();
@@ -2357,7 +2694,9 @@ async function handleFillTable() {
       closeTime: 5000,
     })
       .createLine({
-        text: `❌ 填表失败: ${error.message || error}`,
+        text: getString("table-fill-failed", {
+          args: { error: error.message || error },
+        }),
         type: "error",
       })
       .show();
@@ -2374,13 +2713,16 @@ async function handleMultiRoundSummary() {
     "openai";
 
   // 2. 获取选中条目
-  const items = Zotero.getActiveZoteroPane().getSelectedItems();
+  const items = Zotero.getActiveZoteroPane()?.getSelectedItems() ?? [];
   if (!items || items.length === 0) {
     new ztoolkit.ProgressWindow("AI Butler", {
       closeOnClick: true,
       closeTime: 3000,
     })
-      .createLine({ text: "请先选择要处理的文献", type: "error" })
+      .createLine({
+        text: getString("task-error-no-paper-selected"),
+        type: "error",
+      })
       .show();
     return;
   }
@@ -2405,8 +2747,10 @@ async function handleMultiRoundSummary() {
     })
       .createLine({
         text: priority
-          ? "已将 1 个重分析任务加入高优队列"
-          : `已将 ${items.length} 个重分析任务加入普通队列，将按批次设置处理`,
+          ? getString("deep-read-queue-priority-added")
+          : getString("deep-read-queue-normal-added", {
+              args: { count: items.length },
+            }),
         type: "success",
       })
       .show();
@@ -2416,7 +2760,12 @@ async function handleMultiRoundSummary() {
       closeOnClick: true,
       closeTime: 5000,
     })
-      .createLine({ text: "加入队列失败: " + error.message, type: "error" })
+      .createLine({
+        text: getString("queue-add-failed", {
+          args: { error: error.message || error },
+        }),
+        type: "error",
+      })
       .show();
   }
 }

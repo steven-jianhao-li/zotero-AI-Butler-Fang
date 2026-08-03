@@ -18,6 +18,7 @@
  * @author AI-Butler Team
  */
 
+import { getString } from "../utils/locale";
 import { getPref } from "../utils/prefs";
 import type { LLMAbortSignal } from "./llmproviders/types";
 import {
@@ -29,10 +30,7 @@ import {
 
 export type ImageSummaryRequestMode = "gemini" | "openai";
 export type ImageSummaryCustomHeadersInput =
-  | string
-  | Record<string, unknown>
-  | null
-  | undefined;
+  string | Record<string, unknown> | null | undefined;
 
 const DEFAULT_IMAGE_SUMMARY_REQUEST_TIMEOUT_SECONDS = 600;
 const MIN_IMAGE_SUMMARY_REQUEST_TIMEOUT_SECONDS = 30;
@@ -113,6 +111,80 @@ export class ImageClient {
     return "gemini";
   }
 
+  /**
+   * Gecko HTTP/2 workaround for Gemini direct connections.
+   *
+   * Temporarily disables HTTP/2 to force HTTP/1.1 and raises network
+   * timeout prefs to match the configured request timeout.
+   *
+   * Only used for the Gemini path where the target host has no existing
+   * HTTP/2 connection in the pool.  NOT used for OpenAI-compatible
+   * proxies — those require server-side proxy_read_timeout tuning.
+   */
+  private static applyGeckoHttpWorkaround(
+    requestTimeoutMs: number,
+  ): { key: string; type: "int" | "bool"; val: any }[] {
+    const savedPrefs: { key: string; type: "int" | "bool"; val: any }[] = [];
+
+    const tuneIntPref = (key: string, newVal: number) => {
+      try {
+        let old: number | null = null;
+        try {
+          old = Services.prefs.getIntPref(key);
+        } catch {
+          /* pref does not exist */
+        }
+        savedPrefs.push({ key, type: "int", val: old });
+        Services.prefs.setIntPref(key, newVal);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const tuneBoolPref = (key: string, newVal: boolean) => {
+      try {
+        let old: boolean | null = null;
+        try {
+          old = Services.prefs.getBoolPref(key);
+        } catch {
+          /* pref does not exist */
+        }
+        savedPrefs.push({ key, type: "bool", val: old });
+        Services.prefs.setBoolPref(key, newVal);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    tuneBoolPref("network.http.http2.enabled", false);
+    tuneBoolPref("network.http.spdy.enabled", false);
+    const networkTimeoutSeconds = Math.max(
+      30,
+      Math.ceil(requestTimeoutMs / 1000),
+    );
+    tuneIntPref("network.http.response.timeout", networkTimeoutSeconds);
+    tuneIntPref("network.http.connection-timeout", networkTimeoutSeconds);
+
+    return savedPrefs;
+  }
+
+  private static restoreGeckoPrefs(
+    savedPrefs: { key: string; type: "int" | "bool"; val: any }[],
+  ): void {
+    for (const { key, type, val } of savedPrefs) {
+      try {
+        if (val !== null) {
+          if (type === "bool") Services.prefs.setBoolPref(key, val);
+          else Services.prefs.setIntPref(key, val);
+        } else {
+          Services.prefs.clearUserPref(key);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   private static normalizeApiUrl(url: string): string {
     return (url || "").trim().replace(/\/$/, "");
   }
@@ -153,20 +225,25 @@ export class ImageClient {
           ? this.parseCustomHeadersText(rawHeaders)
           : rawHeaders;
     } catch (error: any) {
-      throw new ImageGenerationError("自定义 Header 格式错误", {
-        errorName: "InvalidCustomHeaders",
-        errorMessage:
-          error?.message ||
-          '额外 Header 必须是对象格式，例如 {"X-ModelScope-Async-Mode": "true"}',
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-custom-headers-format"),
+        {
+          errorName: "InvalidCustomHeaders",
+          errorMessage:
+            error?.message ||
+            getString("image-client-error-custom-headers-object"),
+        },
+      );
     }
 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new ImageGenerationError("自定义 Header 格式错误", {
-        errorName: "InvalidCustomHeaders",
-        errorMessage:
-          '额外 Header 必须是对象格式，例如 {"X-ModelScope-Async-Mode": "true"}',
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-custom-headers-format"),
+        {
+          errorName: "InvalidCustomHeaders",
+          errorMessage: getString("image-client-error-custom-headers-object"),
+        },
+      );
     }
 
     const headers: Record<string, string> = {};
@@ -176,10 +253,16 @@ export class ImageClient {
       const headerName = name.trim();
       if (!headerName) continue;
       if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(headerName)) {
-        throw new ImageGenerationError("自定义 Header 名称无效", {
-          errorName: "InvalidCustomHeaderName",
-          errorMessage: `Header 名称 "${headerName}" 不合法`,
-        });
+        throw new ImageGenerationError(
+          getString("image-client-error-custom-header-name"),
+          {
+            errorName: "InvalidCustomHeaderName",
+            errorMessage: getString(
+              "image-client-error-custom-header-name-detail",
+              { args: { name: headerName } },
+            ),
+          },
+        );
       }
       if (
         value === null ||
@@ -188,18 +271,30 @@ export class ImageClient {
           typeof value !== "number" &&
           typeof value !== "boolean")
       ) {
-        throw new ImageGenerationError("自定义 Header 值无效", {
-          errorName: "InvalidCustomHeaderValue",
-          errorMessage: `Header "${headerName}" 的值必须是字符串、数字或布尔值`,
-        });
+        throw new ImageGenerationError(
+          getString("image-client-error-custom-header-value"),
+          {
+            errorName: "InvalidCustomHeaderValue",
+            errorMessage: getString(
+              "image-client-error-custom-header-value-type",
+              { args: { name: headerName } },
+            ),
+          },
+        );
       }
 
       const headerValue = String(value).trim();
       if (/[\r\n]/.test(headerValue)) {
-        throw new ImageGenerationError("自定义 Header 值无效", {
-          errorName: "InvalidCustomHeaderValue",
-          errorMessage: `Header "${headerName}" 的值不能包含换行符`,
-        });
+        throw new ImageGenerationError(
+          getString("image-client-error-custom-header-value"),
+          {
+            errorName: "InvalidCustomHeaderValue",
+            errorMessage: getString(
+              "image-client-error-custom-header-value-newline",
+              { args: { name: headerName } },
+            ),
+          },
+        );
       }
       headers[headerName] = headerValue;
     }
@@ -476,11 +571,12 @@ export class ImageClient {
     );
     if (!mimeType) {
       throw new ImageGenerationError(
-        "Downloaded file is not a supported image",
+        getString("image-client-error-unsupported-downloaded-image"),
         {
           errorName: "UnsupportedImageMimeType",
-          errorMessage:
-            "Image download succeeded, but the response could not be identified as PNG, JPEG, WebP, or GIF.",
+          errorMessage: getString(
+            "image-client-error-unsupported-downloaded-image-detail",
+          ),
           requestUrl: endpoint,
           responseBody: JSON.stringify({
             contentType: headerMime || "",
@@ -501,7 +597,8 @@ export class ImageClient {
     timeoutMs?: number,
   ): Promise<{ imageBase64: string; mimeType: string }> {
     const endpoint = url.trim();
-    if (!endpoint) throw new Error("Empty image URL");
+    if (!endpoint)
+      throw new Error(getString("image-client-error-empty-image-url"));
     const requestTimeoutMs = this.normalizeRequestTimeoutMs(timeoutMs);
 
     let res: any;
@@ -517,22 +614,27 @@ export class ImageClient {
       const statusCode = error?.xmlhttp?.status;
       const responseBody =
         error?.xmlhttp?.response || error?.xmlhttp?.responseText || "";
-      throw new ImageGenerationError("下载图片失败", {
-        errorName: "ImageDownloadError",
-        errorMessage: error?.message || "无法下载图片资源",
-        statusCode,
-        requestUrl: endpoint,
-        responseBody:
-          typeof responseBody === "string"
-            ? responseBody
-            : JSON.stringify(responseBody),
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-download-failed"),
+        {
+          errorName: "ImageDownloadError",
+          errorMessage:
+            error?.message || getString("image-client-error-download-resource"),
+          statusCode,
+          requestUrl: endpoint,
+          responseBody:
+            typeof responseBody === "string"
+              ? responseBody
+              : JSON.stringify(responseBody),
+        },
+      );
     }
 
     if (res?.status !== 200) {
+      const unknownValue = getString("common-unknown-value");
       throw new ImageGenerationError(`HTTP ${res?.status}`, {
-        errorName: `HTTP_${res?.status || "Unknown"}`,
-        errorMessage: `HTTP ${res?.status || "Unknown"}: ${res?.statusText || "下载失败"}`,
+        errorName: `HTTP_${res?.status || unknownValue}`,
+        errorMessage: `HTTP ${res?.status || unknownValue}: ${res?.statusText || getString("image-client-error-download-status")}`,
         statusCode: res?.status,
         requestUrl: endpoint,
         responseBody: res?.response,
@@ -617,12 +719,15 @@ export class ImageClient {
           : undefined,
     };
 
-    throw new ImageGenerationError("下载图片失败", {
-      errorName: "EmptyImageBody",
-      errorMessage: "图片下载成功但响应体为空或无法解析",
-      requestUrl: endpoint,
-      responseBody: JSON.stringify(bodyDebug),
-    });
+    throw new ImageGenerationError(
+      getString("image-client-error-download-failed"),
+      {
+        errorName: "EmptyImageBody",
+        errorMessage: getString("image-client-error-download-empty-body"),
+        requestUrl: endpoint,
+        responseBody: JSON.stringify(bodyDebug),
+      },
+    );
   }
 
   private static extractImageFromOpenAIChatMessage(message: any): {
@@ -1046,6 +1151,10 @@ export class ImageClient {
     return /^gpt-image-2(?:$|[-_.:])/i.test((model || "").trim());
   }
 
+  private static isAgnesImageModel(model: string): boolean {
+    return /^agnes-image(?:$|[-_.:])/i.test((model || "").trim());
+  }
+
   private static gcd(a: number, b: number): number {
     let x = Math.abs(a);
     let y = Math.abs(b);
@@ -1210,7 +1319,11 @@ export class ImageClient {
     },
     endpointType: "images" | "responses" | "chat",
   ): string | null {
-    if (!config.aspectRatio && !config.resolution) return null;
+    if (!config.aspectRatio && !config.resolution) {
+      return this.isAgnesImageModel(config.model) && endpointType === "images"
+        ? "1024x1024"
+        : null;
+    }
 
     if (endpointType === "responses" || this.isGptImage2Model(config.model)) {
       return this.buildFlexibleOpenAIImageSize(
@@ -1242,6 +1355,26 @@ export class ImageClient {
         prompt,
       };
       if (imageSize) payload.size = imageSize;
+      if (this.isAgnesImageModel(config.model)) {
+        const explicitSize = this.normalizeOpenAIExplicitSize(
+          config.resolution,
+        );
+        const resolutionTier = this.parseOpenAIResolutionTier(
+          config.resolution,
+        );
+        if (explicitSize && explicitSize !== "auto") {
+          payload.size = explicitSize;
+        } else if (resolutionTier) {
+          payload.size = resolutionTier;
+        } else {
+          payload.size = payload.size || "1024x1024";
+        }
+        if (config.aspectRatio && resolutionTier) {
+          payload.ratio = config.aspectRatio;
+        }
+        payload.return_base64 = true;
+        return payload;
+      }
       if (!this.isGptImageModel(config.model)) {
         payload.response_format = "b64_json";
       }
@@ -1361,7 +1494,16 @@ export class ImageClient {
       const responseBody =
         error?.xmlhttp?.response || error?.xmlhttp?.responseText || "";
 
-      let errorMessage = error?.message || "OpenAI 兼容生图请求失败";
+      ztoolkit.log(
+        `[AI-Butler] OpenAI 生图请求失败 — ` +
+          `status=${statusCode}, ` +
+          `name=${error?.name}, ` +
+          `message=${error?.message}, ` +
+          `result=${error?.result ? "0x" + error.result.toString(16) : "N/A"}`,
+      );
+
+      let errorMessage =
+        error?.message || getString("image-client-error-openai-request-failed");
       let errorName = "NetworkError";
 
       try {
@@ -1417,10 +1559,16 @@ export class ImageClient {
       cleanupAbortSignal?.();
     }
 
+    ztoolkit.log(
+      `[AI-Butler] OpenAI 生图请求完成 — ` +
+        `status=${response.status}, ` +
+        `responseSize=${response.response?.length ?? 0}`,
+    );
+
     if (response.status !== 200) {
       throw new ImageGenerationError(`HTTP ${response.status}`, {
         errorName: `HTTP_${response.status}`,
-        errorMessage: `HTTP ${response.status}: ${response.statusText || "请求失败"}`,
+        errorMessage: `HTTP ${response.status}: ${response.statusText || getString("image-client-error-request-failed")}`,
         statusCode: response.status,
         requestUrl: endpoint,
         responseBody: response.response,
@@ -1456,22 +1604,29 @@ export class ImageClient {
           typeof response.response === "string"
             ? response.response.substring(0, 800)
             : JSON.stringify(response.response).substring(0, 800);
-        throw new ImageGenerationError("API 未返回图片数据", {
-          errorName: "NoImageData",
-          errorMessage:
-            "OpenAI 兼容接口响应中未识别到图片数据。请确认接口是否支持图片输出，或尝试将 API 地址设置为完整端点（如 /v1/responses、/v1/chat/completions 或 /v1/images/generations）。",
-          requestUrl: endpoint,
-          responseBody: preview,
-        });
+        throw new ImageGenerationError(
+          getString("image-client-error-no-image-data"),
+          {
+            errorName: "NoImageData",
+            errorMessage: getString("image-client-error-no-image-data-detail"),
+            requestUrl: endpoint,
+            responseBody: preview,
+          },
+        );
       }
     } catch (error: any) {
       if (error instanceof ImageGenerationError) throw error;
-      throw new ImageGenerationError("解析 API 响应失败", {
-        errorName: "ParseError",
-        errorMessage: error?.message || "无法解析 OpenAI 兼容接口响应",
-        requestUrl: endpoint,
-        responseBody: response.response,
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-parse-response"),
+        {
+          errorName: "ParseError",
+          errorMessage:
+            error?.message ||
+            getString("image-client-error-parse-openai-response"),
+          requestUrl: endpoint,
+          responseBody: response.response,
+        },
+      );
     }
   }
 
@@ -1537,13 +1692,16 @@ export class ImageClient {
       (getPref("imageSummaryResolutionEnabled" as any) as boolean) ?? false;
 
     if (!apiKey) {
-      throw new ImageGenerationError("一图总结 API Key 未配置", {
-        errorName: "ConfigurationError",
-        errorMessage:
-          requestMode === "openai"
-            ? "请在设置页面配置一图总结的 OpenAI API Key"
-            : "请在设置页面配置一图总结的 Gemini API Key",
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-api-key-missing"),
+        {
+          errorName: "ConfigurationError",
+          errorMessage:
+            requestMode === "openai"
+              ? getString("image-client-error-openai-key-missing")
+              : getString("image-client-error-gemini-key-missing"),
+        },
+      );
     }
 
     if (requestMode === "openai") {
@@ -1601,53 +1759,9 @@ export class ImageClient {
     );
     const requestStartTime = Date.now();
 
-    // Gecko 的 HTTP/2 实现有独立的 stream 空闲超时 (~30-45s)，
-    // 不受 network.http.response.timeout 等偏好控制。
-    // Gemini 生成 4K 图片时服务器在 50-120 秒内不返回任何数据，触发此超时。
-    // 解决方案：临时禁用 HTTP/2 强制 HTTP/1.1（无 stream 层超时），
-    // 并提升网络超时偏好，请求完成后恢复。
-    const savedPrefs: { key: string; type: "int" | "bool"; val: any }[] = [];
-
-    const tuneIntPref = (key: string, newVal: number) => {
-      try {
-        let old: number | null = null;
-        try {
-          old = Services.prefs.getIntPref(key);
-        } catch {
-          /* pref does not exist */
-        }
-        savedPrefs.push({ key, type: "int", val: old });
-        Services.prefs.setIntPref(key, newVal);
-      } catch {
-        /* ignore */
-      }
-    };
-
-    const tuneBoolPref = (key: string, newVal: boolean) => {
-      try {
-        let old: boolean | null = null;
-        try {
-          old = Services.prefs.getBoolPref(key);
-        } catch {
-          /* pref does not exist */
-        }
-        savedPrefs.push({ key, type: "bool", val: old });
-        Services.prefs.setBoolPref(key, newVal);
-      } catch {
-        /* ignore */
-      }
-    };
-
-    tuneBoolPref("network.http.http2.enabled", false);
-    tuneBoolPref("network.http.spdy.enabled", false);
-    const networkTimeoutSeconds = Math.max(
-      30,
-      Math.ceil(requestTimeoutMs / 1000),
-    );
-    tuneIntPref("network.http.response.timeout", networkTimeoutSeconds);
-    tuneIntPref("network.http.connection-timeout", networkTimeoutSeconds);
-
     throwIfAborted(options?.abortSignal);
+
+    const savedPrefs = this.applyGeckoHttpWorkaround(requestTimeoutMs);
 
     let response: any;
     let abortError: Error | null = null;
@@ -1677,7 +1791,8 @@ export class ImageClient {
       const responseBody =
         error?.xmlhttp?.response || error?.xmlhttp?.responseText || "";
 
-      let errorMessage = error?.message || "Gemini 生图请求失败";
+      let errorMessage =
+        error?.message || getString("image-client-gemini-request-failed");
       let errorName = "NetworkError";
 
       try {
@@ -1724,20 +1839,7 @@ export class ImageClient {
       });
     } finally {
       cleanupAbortSignal?.();
-
-      // 恢复所有 Gecko 偏好
-      for (const { key, type, val } of savedPrefs) {
-        try {
-          if (val !== null) {
-            if (type === "bool") Services.prefs.setBoolPref(key, val);
-            else Services.prefs.setIntPref(key, val);
-          } else {
-            Services.prefs.clearUserPref(key);
-          }
-        } catch {
-          /* ignore */
-        }
-      }
+      this.restoreGeckoPrefs(savedPrefs);
     }
 
     const elapsedSec = ((Date.now() - requestStartTime) / 1000).toFixed(1);
@@ -1800,15 +1902,20 @@ export class ImageClient {
 
       const candidates = json?.candidates || [];
       if (candidates.length === 0) {
-        throw new ImageGenerationError("API 未返回任何结果", {
-          errorName: "EmptyResponse",
-          errorMessage: "Gemini API 返回了空的 candidates 数组",
-          requestUrl: endpoint,
-          responseBody:
-            typeof response.response === "string"
-              ? response.response.substring(0, 1000)
-              : response.response,
-        });
+        throw new ImageGenerationError(
+          getString("image-client-error-empty-response"),
+          {
+            errorName: "EmptyResponse",
+            errorMessage: getString(
+              "image-client-error-gemini-empty-candidates",
+            ),
+            requestUrl: endpoint,
+            responseBody:
+              typeof response.response === "string"
+                ? response.response.substring(0, 1000)
+                : response.response,
+          },
+        );
       }
 
       const parts = candidates[0]?.content?.parts || [];
@@ -1817,25 +1924,36 @@ export class ImageClient {
       if (!imagePart) {
         const textPart = parts.find((p: any) => p.text);
         if (textPart) {
-          throw new ImageGenerationError("API 返回了文本而非图片", {
-            errorName: "NoImageGenerated",
-            errorMessage: `模型返回了文本内容而非图片。请检查模型是否支持图片生成。\n\n返回内容: ${textPart.text?.substring(0, 200)}...`,
+          throw new ImageGenerationError(
+            getString("image-client-error-text-not-image"),
+            {
+              errorName: "NoImageGenerated",
+              errorMessage: getString(
+                "image-client-error-text-not-image-detail",
+                {
+                  args: { text: textPart.text?.substring(0, 200) || "" },
+                },
+              ),
+              requestUrl: endpoint,
+              responseBody:
+                typeof response.response === "string"
+                  ? response.response.substring(0, 1000)
+                  : response.response,
+            },
+          );
+        }
+        throw new ImageGenerationError(
+          getString("image-client-error-no-image-data"),
+          {
+            errorName: "NoImageData",
+            errorMessage: getString("image-client-error-gemini-no-inline-data"),
             requestUrl: endpoint,
             responseBody:
               typeof response.response === "string"
                 ? response.response.substring(0, 1000)
                 : response.response,
-          });
-        }
-        throw new ImageGenerationError("API 未返回图片数据", {
-          errorName: "NoImageData",
-          errorMessage: "Gemini API 响应中未包含 inlineData 图片数据",
-          requestUrl: endpoint,
-          responseBody:
-            typeof response.response === "string"
-              ? response.response.substring(0, 1000)
-              : response.response,
-        });
+          },
+        );
       }
 
       const imageBase64 = imagePart.inlineData.data;
@@ -1856,15 +1974,20 @@ export class ImageClient {
       if (error instanceof ImageGenerationError) {
         throw error;
       }
-      throw new ImageGenerationError("解析 API 响应失败", {
-        errorName: "ParseError",
-        errorMessage: error?.message || "无法解析 Gemini API 响应",
-        requestUrl: endpoint,
-        responseBody:
-          typeof response.response === "string"
-            ? response.response.substring(0, 1000)
-            : response.response,
-      });
+      throw new ImageGenerationError(
+        getString("image-client-error-parse-response"),
+        {
+          errorName: "ParseError",
+          errorMessage:
+            error?.message ||
+            getString("image-client-error-parse-gemini-response"),
+          requestUrl: endpoint,
+          responseBody:
+            typeof response.response === "string"
+              ? response.response.substring(0, 1000)
+              : response.response,
+        },
+      );
     }
   }
 
@@ -1891,12 +2014,17 @@ export class ImageClient {
       if (result.imageBase64) {
         return {
           success: true,
-          message: `✅ 连接成功！生成了 ${result.mimeType} 格式的图片 (${Math.round(result.imageBase64.length / 1024)} KB)`,
+          message: getString("image-client-test-success", {
+            args: {
+              mimeType: result.mimeType,
+              size: Math.round(result.imageBase64.length / 1024),
+            },
+          }),
         };
       } else {
         return {
           success: false,
-          message: "⚠️ 连接成功但未返回图片数据",
+          message: getString("image-client-test-no-image"),
         };
       }
     } catch (error: any) {
@@ -1904,7 +2032,9 @@ export class ImageClient {
         error instanceof ImageGenerationError ? error.details : null;
       return {
         success: false,
-        message: `❌ 连接失败: ${details?.errorMessage || error.message}`,
+        message: getString("image-client-test-failed", {
+          args: { message: details?.errorMessage || error.message },
+        }),
       };
     }
   }
@@ -1915,18 +2045,26 @@ export class ImageClient {
   public static formatError(error: any): string {
     if (error instanceof ImageGenerationError) {
       const d = error.details;
-      let report = `错误名称: ${d.errorName}\n`;
-      report += `错误信息: ${d.errorMessage}\n`;
+      let report = `${getString("image-client-error-name", {
+        args: { name: d.errorName },
+      })}\n`;
+      report += `${getString("image-client-error-message", {
+        args: { message: d.errorMessage },
+      })}\n`;
       if (d.statusCode) {
-        report += `HTTP 状态码: ${d.statusCode}\n`;
+        report += `${getString("image-client-error-http-status", {
+          args: { status: d.statusCode },
+        })}\n`;
       }
       if (d.requestUrl) {
-        report += `请求地址: ${d.requestUrl}\n`;
+        report += `${getString("image-client-error-request-url", {
+          args: { url: d.requestUrl },
+        })}\n`;
       }
       if (d.responseBody) {
-        report += `\n响应内容:\n${d.responseBody.substring(0, 1000)}`;
+        report += `\n${getString("image-client-error-response-body")}\n${d.responseBody.substring(0, 1000)}`;
         if (d.responseBody.length > 1000) {
-          report += "\n... (已截断)";
+          report += `\n${getString("image-client-error-truncated")}`;
         }
       }
       return report;

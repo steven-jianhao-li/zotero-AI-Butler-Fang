@@ -53,13 +53,20 @@ pref("__prefsPrefix__.topP", "1.0");
 pref("__prefsPrefix__.enableTopP", false);
 pref("__prefsPrefix__.reasoningEffort", "default");
 pref("__prefsPrefix__.stream", true);
-pref("__prefsPrefix__.enablePromptCacheOptimization", false);
+pref("__prefsPrefix__.enablePromptCacheOptimization", true);
 pref("__prefsPrefix__.requestTimeout", "300000"); // 5分钟超时
+pref("__prefsPrefix__.autoContinuationRounds", "2");
 // MINERU API KEY
 pref("__prefsPrefix__.mineruApiKey", "");
 pref("__prefsPrefix__.mineruModelVersion", "vlm");
+pref("__prefsPrefix__.mineruSaveMarkdown", false);
+pref("__prefsPrefix__.mineruSaveAsAttachment", true);
+pref("__prefsPrefix__.mineruSyncExternal", false);
+pref("__prefsPrefix__.mineruExternalPath", "");
+pref("__prefsPrefix__.mineruFileNameMode", "citationKey-title");
 
 // ==================== 提示词配置 ====================
+pref("__prefsPrefix__.promptLanguage", "auto"); // "auto" 跟随 Zotero 界面语言，或固定为 "zh-CN" / "en-US"
 pref(
   "__prefsPrefix__.summaryPrompt",
   "# 角色\n您好，我是您的AI管家。我将为您 meticulously 地阅读这篇论文，并为您整理一份详尽的笔记。\n\n# 任务\n请为我分析下方提供的学术论文，并生成一份包含以下三个部分的综合性总结：\n\n### 第一部分：核心摘要\n请用一个段落高度概括论文的核心内容，包括研究问题、方法、关键发现和主要结论，让我能迅速掌握论文的精髓。\n\n### 第二部分：章节详解\n请识别并划分论文的主要章节（如引言、方法、结果、讨论等），并为每个章节提供一个清晰的标题和详细的内容总结。\n\n### 第三部分：创新与局限\n请根据论文内容，分析并总结其主要创新点和存在的局限性，并指出未来可能的研究方向。\n\n# 输出要求\n- 结构清晰，逻辑严谨。\n- 语言精炼，准确传达。\n- 请使用中文进行回答。",
@@ -86,6 +93,7 @@ pref("__prefsPrefix__.autoScanDeepReadEnabled", false);
 pref("__prefsPrefix__.scanInterval", "300");
 pref("__prefsPrefix__.pdfProcessMode", "base64"); // "text"、"base64" 或 "mineru"
 pref("__prefsPrefix__.pdfAttachmentMode", "default"); // "default" 或 "all"
+pref("__prefsPrefix__.autoDownloadMissingPdf", true); // 缺失本地 PDF 时自动从 Zotero 云端下载
 
 // ==================== 一图总结配置 ====================
 pref("__prefsPrefix__.imageSummaryCustomHeaders", ""); // 额外请求 Headers，JSON/Python dict 对象字符串
@@ -123,6 +131,7 @@ pref(
 );
 pref("__prefsPrefix__.sidebarNoteCollapsed", false);
 pref("__prefsPrefix__.sidebarImageCollapsed", false);
+pref("__prefsPrefix__.quickChatSuppressNewConversationWarning", false);
 
 // ==================== 数据管理 ====================
 pref("__prefsPrefix__.notePrefix", "[AI-Butler]");
@@ -143,3 +152,6 @@ pref("__prefsPrefix__.noteExportSuppressDirectoryPrompt", false);
 // ==================== 思维导图配置 ====================
 pref("__prefsPrefix__.mindmapPrompt", ""); // 空表示使用默认提示词
 pref("__prefsPrefix__.mindmapExportPath", ""); // 空表示使用桌面目录
+
+// ==================== 新手教程配置 ====================
+pref("__prefsPrefix__.onboardingTutorialSeenVersion", "");

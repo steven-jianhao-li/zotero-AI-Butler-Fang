@@ -8,10 +8,12 @@ import {
   ProgressCb,
 } from "./types";
 import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
+import { getString } from "../../utils/locale";
 import { getRequestTimeoutMs } from "./shared/llmutils";
 import {
   getConnectionTestInput,
-  getConnectionTestModeLabel,
+  formatConnectionTestSuccess,
+  formatProviderTimeout,
 } from "./shared/connectionTest";
 import {
   parseModelListResponse,
@@ -23,6 +25,19 @@ import {
   normalizeAbortError,
   throwIfAborted,
 } from "./shared/requestAbort";
+import { recordFinishReason } from "./shared/truncation";
+import {
+  providerHttpRequestFailed,
+  providerMissingApiKey,
+  providerMissingApiUrl,
+  providerNoPdfFiles,
+  providerNoPdfProcessed,
+  providerRequestFailed,
+  providerStreamMissingDone,
+  providerStreamParseFailed,
+  providerStreamTruncated,
+  providerStreamUnexpectedEnd,
+} from "./shared/localizedErrors";
 
 type OllamaChatMessage = {
   role: "system" | "user" | "assistant";
@@ -58,7 +73,7 @@ export class OllamaProvider implements ILlmProvider {
       options.apiUrl || "http://localhost:11434",
     );
     const apiKey = (options.apiKey || "").trim();
-    if (!apiBaseUrl) throw new Error("Ollama API URL 未配置");
+    if (!apiBaseUrl) throw new Error(providerMissingApiUrl("Ollama"));
     return {
       apiBaseUrl,
       chatUrl: `${apiBaseUrl}/chat`,
@@ -153,9 +168,7 @@ export class OllamaProvider implements ILlmProvider {
   }
 
   private rejectPdfBase64(): never {
-    throw new Error(
-      "Ollama 原生接口不支持 PDF Base64 输入。请在 PDF 处理配置中切换为“文本提取”或“MinerU”后再使用 Ollama。",
-    );
+    throw new Error(getString("provider-error-ollama-pdf-base64-unsupported"));
   }
 
   async generateSummary(
@@ -263,10 +276,11 @@ export class OllamaProvider implements ILlmProvider {
       const status = error?.xmlhttp?.status;
       const parsed = this.parseErrorBody(responseBody);
       throw new APITestError(
-        parsed.message || error?.message || "Ollama 请求失败",
+        parsed.message || error?.message || providerRequestFailed("Ollama"),
         {
           errorName: parsed.name || "OllamaError",
-          errorMessage: parsed.message || error?.message || "Ollama 请求失败",
+          errorMessage:
+            parsed.message || error?.message || providerRequestFailed("Ollama"),
           statusCode: status,
           requestUrl: chatUrl,
           requestBody: payloadStr,
@@ -284,7 +298,7 @@ export class OllamaProvider implements ILlmProvider {
     if (status < 200 || status >= 300) {
       throw new APITestError(`HTTP ${status}`, {
         errorName: `HTTP_${status}`,
-        errorMessage: `HTTP ${status}: ${response.statusText || "请求失败"}`,
+        errorMessage: `HTTP ${status}: ${response.statusText || providerRequestFailed("API")}`,
         statusCode: status,
         requestUrl: chatUrl,
         requestBody: payloadStr,
@@ -294,7 +308,12 @@ export class OllamaProvider implements ILlmProvider {
     }
 
     const content = this.extractTextFromRawResponse(rawResponse);
-    return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n连接成功!\n模型: ${model}\n响应: ${content}\n\n--- 原始响应 ---\n${rawResponse}`;
+    return formatConnectionTestSuccess({
+      mode: testInput.mode,
+      model,
+      response: content,
+      rawResponse,
+    });
   }
 
   private async nonStreamRequest(
@@ -325,15 +344,18 @@ export class OllamaProvider implements ILlmProvider {
         },
       });
       throwIfAborted(options.abortSignal);
-      const text = this.extractTextFromRawResponse(response.response || "");
-      if (!text) throw new Error("Ollama 返回内容为空");
+      const text = this.extractTextFromRawResponse(
+        response.response || "",
+        options,
+      );
+      if (!text) throw new Error(providerRequestFailed("Ollama"));
       if (onProgress) await onProgress(text);
       return text;
     } catch (error: any) {
       if (abortError || isAbortError(error, options.abortSignal)) {
         throw normalizeAbortError(abortError || error, options.abortSignal);
       }
-      throw this.toRequestError(error, "Ollama 请求失败");
+      throw this.toRequestError(error, providerRequestFailed("Ollama"));
     } finally {
       cleanupAbortSignal?.();
     }
@@ -375,7 +397,7 @@ export class OllamaProvider implements ILlmProvider {
       for (const rawLine of lines) {
         const line = rawLine.trim();
         if (!line) continue;
-        const chunk = this.extractTextFromStreamLine(line);
+        const chunk = this.extractTextFromStreamLine(line, options);
         if (chunk) deliver(chunk);
       }
     };
@@ -401,7 +423,7 @@ export class OllamaProvider implements ILlmProvider {
             if (status >= 400) {
               abortError = this.toRequestError(
                 { xmlhttp: event.target },
-                `HTTP ${status}: Ollama 请求失败`,
+                providerHttpRequestFailed(status),
               );
               xmlhttp.abort();
               return;
@@ -419,7 +441,9 @@ export class OllamaProvider implements ILlmProvider {
           xmlhttp.ontimeout = () => {
             if (!abortError) {
               abortError = new Error(
-                `Timeout: 请求超过 ${options.requestTimeoutMs ?? getRequestTimeoutMs()} ms`,
+                formatProviderTimeout(
+                  options.requestTimeoutMs ?? getRequestTimeoutMs(),
+                ),
               );
             }
           };
@@ -434,7 +458,10 @@ export class OllamaProvider implements ILlmProvider {
       }
       if (abortError && chunks.length === 0) throw abortError;
       if (chunks.length > 0) return chunks.join("");
-      throw this.toRequestError(error, "Ollama 流式请求失败");
+      throw this.toRequestError(
+        error,
+        providerRequestFailed("Ollama streaming"),
+      );
     } finally {
       cleanupAbortSignal?.();
     }
@@ -448,16 +475,27 @@ export class OllamaProvider implements ILlmProvider {
 
     const text = chunks.join("");
     if (!text) {
-      throw new Error("Ollama 返回内容为空");
+      throw new Error(providerRequestFailed("Ollama"));
     }
     return text;
   }
 
-  private extractTextFromStreamLine(line: string): string {
+  private extractTextFromStreamLine(
+    line: string,
+    options?: LLMOptions,
+  ): string {
     const jsonText = line.replace(/^data:\s*/, "").trim();
     if (!jsonText || jsonText === "[DONE]") return "";
     try {
       const data = JSON.parse(jsonText);
+      if (options) {
+        recordFinishReason(
+          options,
+          "ollama",
+          "done_reason",
+          data?.done_reason || data?.finish_reason,
+        );
+      }
       return this.extractText(data);
     } catch (error) {
       ztoolkit.log("[AI-Butler] Ollama stream parse error:", error);
@@ -465,18 +503,32 @@ export class OllamaProvider implements ILlmProvider {
     }
   }
 
-  private extractTextFromRawResponse(rawResponse: string): string {
+  private extractTextFromRawResponse(
+    rawResponse: string,
+    options?: LLMOptions,
+  ): string {
     if (!rawResponse) return "";
     const trimmed = rawResponse.trim();
     if (!trimmed) return "";
 
     const lines = trimmed.split(/\r?\n/).filter((line) => line.trim());
     if (lines.length > 1) {
-      return lines.map((line) => this.extractTextFromStreamLine(line)).join("");
+      return lines
+        .map((line) => this.extractTextFromStreamLine(line, options))
+        .join("");
     }
 
     try {
-      return this.extractText(JSON.parse(trimmed));
+      const data = JSON.parse(trimmed);
+      if (options) {
+        recordFinishReason(
+          options,
+          "ollama",
+          "done_reason",
+          data?.done_reason || data?.finish_reason,
+        );
+      }
+      return this.extractText(data);
     } catch {
       return trimmed;
     }

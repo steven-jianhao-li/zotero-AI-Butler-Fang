@@ -21,6 +21,7 @@ export default [
       "addon/lib/**/*.js",
       "addon/content/**/*.js",
       "scripts/**/*.mjs",
+      "scripts/**/*.cjs",
       "scripts/**/*.ts",
     ],
     rules: {
@@ -35,6 +36,7 @@ export default [
       "no-useless-escape": "off",
       "no-cond-assign": "off",
       "no-unreachable": "off",
+      "no-useless-assignment": "off",
     },
   },
 ];

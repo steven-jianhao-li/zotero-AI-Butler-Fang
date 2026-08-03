@@ -25,8 +25,13 @@
  * @author AI-Butler Team
  */
 
+import { ContentExtractor } from "./contentExtractor";
 import { PDFExtractor } from "./pdfExtractor";
-import LLMService, { type LLMChatRequest } from "./llmService";
+import LLMService, {
+  type LLMChatRequest,
+  type LLMLifecycleEvent,
+} from "./llmService";
+import type { TaskProgressMeta } from "./taskQueue";
 import {
   LLMEndpointManager,
   type LLMEndpoint,
@@ -36,7 +41,7 @@ import {
   LLMNoteMetadataService,
   type LLMNoteMetadata,
 } from "./llmNoteMetadata";
-import { markdownToZoteroNoteHtml } from "./noteMarkdown";
+import { markdownToZoteroNoteHtml, zoteroNoteMathHtml } from "./noteMarkdown";
 import type { LLMAbortSignal, LLMResponse } from "./llmproviders/types";
 import {
   isAbortError,
@@ -44,11 +49,12 @@ import {
 } from "./llmproviders/shared/requestAbort";
 import { SummaryView } from "./views/SummaryView";
 import { getPref } from "../utils/prefs";
+import { getString } from "../utils/locale";
 import { MainWindow } from "./views/MainWindow";
 import { marked } from "marked";
 import {
-  DEFAULT_TABLE_FILL_PROMPT,
-  DEFAULT_TABLE_TEMPLATE,
+  getConfiguredTableFillPrompt,
+  getConfiguredTableTemplate,
   getBuiltinMultiRoundPromptTemplates,
   getDefaultMultiRoundPromptTemplate,
   mergeMultiRoundPromptTemplates,
@@ -99,8 +105,9 @@ type MultiModelSummaryResult = {
  * 提供静态方法集合,封装论文笔记生成的核心逻辑
  * 采用静态方法设计,简化调用方式,无需实例化
  */
-const INVALID_AI_SOURCE_ITEM_MESSAGE =
-  "AI 总结/精读仅支持顶层文献条目，请不要对笔记、附件或子条目运行。";
+function getInvalidAiSourceItemMessage(): string {
+  return getString("note-generator-error-invalid-source-item");
+}
 
 function isAiSourceItem(item: Zotero.Item): boolean {
   const rawItem = item as any;
@@ -142,7 +149,11 @@ export class NoteGenerator {
   public static async generateNoteForItem(
     item: Zotero.Item,
     outputWindow?: SummaryView,
-    progressCallback?: (message: string, progress: number) => void,
+    progressCallback?: (
+      message: string,
+      progress: number,
+      meta?: TaskProgressMeta,
+    ) => void,
     streamCallback?: (chunk: string) => void,
     options?: {
       summaryMode?: string;
@@ -151,14 +162,14 @@ export class NoteGenerator {
     },
   ): Promise<{ note: Zotero.Item; content: string }> {
     if (!isAiSourceItem(item)) {
-      throw new Error(INVALID_AI_SOURCE_ITEM_MESSAGE);
+      throw new Error(getInvalidAiSourceItemMessage());
     }
 
     // 获取文献标题,用于日志和用户反馈
     const itemTitle = item.getField("title") as string;
     let note: Zotero.Item | null = null;
     let fullContent = "";
-    let llmMetadata: LLMNoteMetadata | null = null;
+    let llmMetadata: LLMNoteMetadata | null;
     let noteContentOverride: string | null = null;
 
     try {
@@ -180,9 +191,7 @@ export class NoteGenerator {
       const useMultiModelSummary =
         summaryMode === "single" && multiModelEndpoints.length > 0;
       const noteKind: AiNoteKind =
-        summaryMode === "single" && !useMultiModelSummary
-          ? "summary"
-          : "deepRead";
+        summaryMode === "single" ? "summary" : "deepRead";
       const existingRecord = await AiNoteService.findNoteRecord(item, noteKind);
       const existing = existingRecord?.note || null;
       const canResumeDeepRead =
@@ -202,7 +211,9 @@ export class NoteGenerator {
       ) {
         if (policy === "skip") {
           progressCallback?.(
-            `\u5df2\u5b58\u5728${AiNoteService.getTitle(noteKind)}\uff0c\u8df3\u8fc7`,
+            getString("note-generator-existing-note-skipped", {
+              args: { kind: AiNoteService.getTitle(noteKind) },
+            }),
             100,
           );
           return {
@@ -214,19 +225,29 @@ export class NoteGenerator {
 
       // Step 1: PDF processing
       throwIfAborted(options?.abortSignal);
-      progressCallback?.("正在处理PDF...", 10);
+      progressCallback?.(
+        getString("progress-note-pdf-processing-message"),
+        10,
+        {
+          stage: "pdf-extracting",
+          label: getString("progress-note-pdf-processing"),
+          detail: getString("progress-note-pdf-processing-detail"),
+        },
+      );
 
       // 检查 PDF 文件大小限制
       const enableSizeLimit =
         (getPref("enablePdfSizeLimit" as any) as boolean) ?? false;
-      if (enableSizeLimit) {
+      if (enableSizeLimit && (await PDFExtractor.hasPDFAttachment(item))) {
         const maxPdfSizeMB = parseFloat(
           (getPref("maxPdfSizeMB" as any) as string) || "50",
         );
         const fileSizeMB = await PDFExtractor.getPdfFileSize(item);
         if (fileSizeMB > maxPdfSizeMB) {
           throw new Error(
-            `PDF 文件过大 (${fileSizeMB.toFixed(1)} MB)，超过设置的阈值 ${maxPdfSizeMB} MB`,
+            getString("note-generator-error-pdf-too-large", {
+              args: { size: fileSizeMB.toFixed(1), max: maxPdfSizeMB },
+            }),
           );
         }
       }
@@ -240,7 +261,7 @@ export class NoteGenerator {
         multiModelEndpoints.length === 0
       ) {
         throw new Error(
-          "已启用多模型同时总结，但没有可用的大模型供应商。请在设置的“模型平台”中选择至少一个已启用供应商。",
+          getString("note-generator-error-multimodel-no-provider"),
         );
       }
 
@@ -268,7 +289,9 @@ export class NoteGenerator {
           if (supportsMultiFile) {
             useMultiPdfMode = true;
             progressCallback?.(
-              `使用多 PDF 模式 (${allPdfs.length} 个文件)...`,
+              getString("note-generator-progress-multipdf-mode", {
+                args: { count: allPdfs.length },
+              }),
               15,
             );
           } else {
@@ -279,7 +302,9 @@ export class NoteGenerator {
                 closeTime: 3000,
               })
                 .createLine({
-                  text: "当前 API 不支持多 PDF 上传，已使用默认 PDF",
+                  text: getString(
+                    "note-generator-warning-multipdf-unsupported",
+                  ),
                   type: "warning",
                 })
                 .show();
@@ -292,7 +317,11 @@ export class NoteGenerator {
 
       // AI 精读会复用同一份 PDF 内容；单次总结交给 LLMService 统一解析，避免 MinerU 重复处理。
       if (summaryMode !== "single" && !useMultiModelSummary) {
-        const extracted = await this.extractPdfContentForMode(item, prefMode);
+        const extracted = await this.extractPdfContentForMode(
+          item,
+          prefMode,
+          progressCallback,
+        );
         pdfContent = extracted.content;
         isBase64 = extracted.isBase64;
       }
@@ -302,15 +331,27 @@ export class NoteGenerator {
       throwIfAborted(options?.abortSignal);
       progressCallback?.(
         summaryMode === "single"
-          ? "正在生成AI总结..."
-          : "正在进行 AI 精读分析...",
+          ? getString("progress-note-generating-summary-message")
+          : getString("progress-note-generating-deep-read-message"),
         40,
+        {
+          stage: "llm-preparing",
+          label:
+            summaryMode === "single"
+              ? getString("progress-note-preparing-summary")
+              : getString("progress-note-preparing-deep-read"),
+          detail: getString("progress-note-llm-ready-detail"),
+        },
       );
 
       // 如果有输出窗口,开始显示当前处理的条目
       if (outputWindow) {
         // 先显示加载状态
-        outputWindow.showLoadingState(`正在分析「${itemTitle}」`);
+        outputWindow.showLoadingState(
+          getString("progress-note-analyzing-title", {
+            args: { title: itemTitle },
+          }),
+        );
       }
 
       // 根据总结模式选择不同的生成策略
@@ -359,7 +400,11 @@ export class NoteGenerator {
               item,
               attachmentMode: "all",
             },
-            transport: { abortSignal: options?.abortSignal },
+            transport: {
+              abortSignal: options?.abortSignal,
+              onStatus: (event) =>
+                this.forwardLLMStatus(progressCallback, event),
+            },
             onProgress,
           });
         } else {
@@ -370,7 +415,11 @@ export class NoteGenerator {
               item,
               attachmentMode: "default",
             },
-            transport: { abortSignal: options?.abortSignal },
+            transport: {
+              abortSignal: options?.abortSignal,
+              onStatus: (event) =>
+                this.forwardLLMStatus(progressCallback, event),
+            },
             onProgress,
           });
         }
@@ -401,7 +450,7 @@ export class NoteGenerator {
 
       if (note && noteContentOverride) {
         progressCallback?.(
-          "AI \u7cbe\u8bfb\u7b14\u8bb0\u5df2\u66f4\u65b0",
+          getString("note-generator-deep-read-note-updated"),
           100,
         );
         return { note, content: fullContent };
@@ -409,11 +458,23 @@ export class NoteGenerator {
 
       // Step 3: create or update note
       throwIfAborted(options?.abortSignal);
-      progressCallback?.(`正在创建${AiNoteService.getTitle(noteKind)}...`, 80);
+      progressCallback?.(
+        getString("note-generator-progress-creating-note-kind", {
+          args: { kind: AiNoteService.getTitle(noteKind) },
+        }),
+        80,
+        {
+          stage: "saving-note",
+          label: getString("progress-note-saving"),
+          detail: getString("progress-note-saving-detail", {
+            args: { kind: AiNoteService.getTitle(noteKind) },
+          }),
+        },
+      );
 
       // 检查内容是否为空，防止创建空笔记
       if (!fullContent || !fullContent.trim()) {
-        throw new Error("AI 返回内容为空，笔记未创建");
+        throw new Error(getString("note-generator-error-empty-note"));
       }
 
       // 格式化笔记内容,添加标题和样式
@@ -442,7 +503,11 @@ export class NoteGenerator {
       }
 
       // 通知进度回调完成 (100%)
-      progressCallback?.("完成！", 100);
+      progressCallback?.(getString("progress-completed-message"), 100, {
+        stage: "completed",
+        label: getString("progress-completed"),
+        detail: getString("progress-note-saved-detail"),
+      });
 
       // 异步并行填表（不阻塞笔记返回）
       const enableTable =
@@ -451,12 +516,12 @@ export class NoteGenerator {
         // 延迟导入以避免循环依赖
         import("./literatureReviewService")
           .then(({ LiteratureReviewService }) => {
-            const tableTemplate =
-              (getPref("tableTemplate" as any) as string) ||
-              DEFAULT_TABLE_TEMPLATE;
-            const fillPrompt =
-              (getPref("tableFillPrompt" as any) as string) ||
-              DEFAULT_TABLE_FILL_PROMPT;
+            const tableTemplate = getConfiguredTableTemplate(
+              getPref("tableTemplate" as any) as string,
+            );
+            const fillPrompt = getConfiguredTableFillPrompt(
+              getPref("tableFillPrompt" as any) as string,
+            );
             const tableStrategy =
               (getPref("tableStrategy" as any) as string) || "skip";
 
@@ -521,19 +586,45 @@ export class NoteGenerator {
     }
   }
 
+  private static forwardLLMStatus(
+    progressCallback:
+      | ((message: string, progress: number, meta?: TaskProgressMeta) => void)
+      | undefined,
+    event: LLMLifecycleEvent,
+  ): void {
+    if (!progressCallback) return;
+    progressCallback(
+      event.message ||
+        event.label ||
+        getString("note-generator-llm-status-update"),
+      event.progress || 40,
+      {
+        ...event,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+  }
+
   private static async extractPdfContentForMode(
     item: Zotero.Item,
     mode: LLMPdfProcessMode,
+    progressCallback?: (
+      message: string,
+      progress: number,
+      meta?: TaskProgressMeta,
+    ) => void,
   ): Promise<{ content: string; isBase64: boolean }> {
-    if (mode === "base64") {
-      return {
-        content: await PDFExtractor.extractBase64FromItem(item),
-        isBase64: true,
-      };
+    const extracted = await ContentExtractor.extractAnalyzableContentFromItem(
+      item,
+      mode === "base64",
+      mode,
+      progressCallback,
+    );
+    if (extracted.isBase64) {
+      return { content: extracted.content, isBase64: true };
     }
 
-    const fullText = await PDFExtractor.extractTextFromItem(item, mode);
-    const cleanedText = PDFExtractor.cleanText(fullText);
+    const cleanedText = PDFExtractor.cleanText(extracted.content);
     return {
       content: PDFExtractor.truncateText(cleanedText),
       isBase64: false,
@@ -550,7 +641,11 @@ export class NoteGenerator {
     pdfAttachmentMode: string;
     prefMode: string;
     outputWindow?: SummaryView;
-    progressCallback?: (message: string, progress: number) => void;
+    progressCallback?: (
+      message: string,
+      progress: number,
+      meta?: TaskProgressMeta,
+    ) => void;
     streamCallback?: (chunk: string) => void;
     abortSignal?: LLMAbortSignal;
   }): Promise<{ content: string; noteHtml: string }> {
@@ -571,10 +666,17 @@ export class NoteGenerator {
     const total = endpoints.length;
     let completed = 0;
 
-    progressCallback?.(`正在使用 ${total} 个模型同时总结...`, 42);
+    progressCallback?.(
+      getString("note-generator-multimodel-progress-start", {
+        args: { total },
+      }),
+      42,
+    );
     if (outputWindow) {
       outputWindow.showLoadingState(
-        `正在使用 ${total} 个模型分析「${itemTitle}」`,
+        getString("note-generator-multimodel-loading", {
+          args: { total, title: itemTitle },
+        }),
       );
     }
 
@@ -593,7 +695,9 @@ export class NoteGenerator {
         });
         completed++;
         progressCallback?.(
-          `模型总结完成：${endpoint.name} (${completed}/${total})`,
+          getString("note-generator-multimodel-endpoint-complete", {
+            args: { name: endpoint.name, completed, total },
+          }),
           42 + Math.floor((completed / total) * 36),
         );
         return result;
@@ -606,7 +710,9 @@ export class NoteGenerator {
           normalized,
         );
         progressCallback?.(
-          `模型总结失败：${endpoint.name} (${completed}/${total})`,
+          getString("note-generator-multimodel-endpoint-failed", {
+            args: { name: endpoint.name, completed, total },
+          }),
           42 + Math.floor((completed / total) * 36),
         );
         return { endpoint, error: normalized };
@@ -630,7 +736,11 @@ export class NoteGenerator {
       const details = failures
         .map((failure) => `${failure.endpoint.name}: ${failure.error.message}`)
         .join("\n");
-      const error = new Error(`多模型同时总结全部失败。\n${details}`);
+      const error = new Error(
+        getString("note-generator-error-multimodel-all-failed", {
+          args: { details },
+        }),
+      );
       const suppressAll =
         failures.length > 0 &&
         failures.every(
@@ -652,7 +762,9 @@ export class NoteGenerator {
       .map((result) => result.noteHtml)
       .join("\n<hr/>\n");
     const displayContent = [
-      `**多模型同时总结完成：${successes.length}/${total} 个模型成功**`,
+      getString("note-generator-multimodel-complete-heading", {
+        args: { success: successes.length, total },
+      }),
       "",
       content,
       failures.length > 0
@@ -660,7 +772,7 @@ export class NoteGenerator {
             "",
             "---",
             "",
-            "## 失败的供应商",
+            getString("note-generator-multimodel-failed-providers-heading"),
             "",
             ...failures.map(
               (failure) =>
@@ -685,8 +797,10 @@ export class NoteGenerator {
 
     progressCallback?.(
       failures.length > 0
-        ? `多模型总结完成：${successes.length} 个成功，${failures.length} 个失败`
-        : "多模型总结完成",
+        ? getString("note-generator-multimodel-finished-with-failures", {
+            args: { success: successes.length, failed: failures.length },
+          })
+        : getString("note-generator-multimodel-finished"),
       80,
     );
 
@@ -718,7 +832,7 @@ export class NoteGenerator {
 
     if (summaryMode !== "single") {
       throw new Error(
-        "Multi-model summary only supports normal AI summary; use deepRead v2 for AI deep read.",
+        getString("note-generator-error-multimodel-summary-mode-unsupported"),
       );
     }
 
@@ -740,14 +854,14 @@ export class NoteGenerator {
     const content = response.text;
 
     if (!content || !content.trim()) {
-      throw new Error("AI 返回内容为空");
+      throw new Error(getString("note-generator-error-empty-response"));
     }
 
     const metadata = LLMNoteMetadataService.fromResponse("summary", response);
     const noteHtml = this.formatNoteContent(
       itemTitle,
       content,
-      "AI 管家",
+      AiNoteService.getTitle("summary"),
       metadata,
     );
 
@@ -778,7 +892,9 @@ export class NoteGenerator {
     return [
       `## ${result.endpoint.name}`,
       "",
-      `供应商: ${result.endpoint.name}  模型: ${model}`,
+      getString("note-generator-model-metadata", {
+        args: { provider: result.endpoint.name, model },
+      }),
       "",
       result.content,
     ].join("\n");
@@ -804,7 +920,7 @@ export class NoteGenerator {
    *   "深度学习综述",
    *   "## 摘要\n这是一篇综述文章..."
    * );
-   * // 返回: <h2>AI 管家 - 深度学习综述</h2><div>...</div>
+   * // 返回: <h2>AI 总结 - 深度学习综述</h2><div>...</div>
    * ```
    */
   public static formatNoteContent(
@@ -923,20 +1039,7 @@ export class NoteGenerator {
         if (!formulaData) return _match;
         const { content, isBlock } = formulaData;
 
-        // 关键修复：必须对 LaTeX 内容进行 HTML 转义，否则 <, >, & 等字符会破坏 XML 结构
-        const escapedContent = NoteGenerator.escapeHtml(content);
-
-        // 根据用户反馈和 Zotero 特性调整：
-        // 鉴于用户反馈块级公式 <math-display> 未渲染，而行内公式有效
-        // 为了稳妥，暂时将所有公式都作为 <math-inline> 生成
-        if (isBlock) {
-          // 块级公式：必须使用 $ 包裹（Zotero不支持 $$），加上 \displaystyle 强制显示为块级样式
-          // 外层用 p 和 style 实现居中
-          return `<p style="text-align: center;"><span class="math">$\\displaystyle ${escapedContent}$</span></p>`;
-        } else {
-          // 行内公式：使用 $ 包裹
-          return `<span class="math">$${escapedContent}$</span>`;
-        }
+        return zoteroNoteMathHtml(content, isBlock);
       },
     );
 
@@ -1039,7 +1142,11 @@ export class NoteGenerator {
     isBase64: boolean;
     itemTitle: string;
     outputWindow?: SummaryView;
-    progressCallback?: (message: string, progress: number) => void;
+    progressCallback?: (
+      message: string,
+      progress: number,
+      meta?: TaskProgressMeta,
+    ) => void;
     streamCallback?: (chunk: string) => void;
     abortSignal?: LLMAbortSignal;
   }): Promise<{
@@ -1069,8 +1176,10 @@ export class NoteGenerator {
     if (templateChanged) {
       this.showDeepReadNotice(
         restoredPlan?.template
-          ? "Template changed; resuming with the template saved in the note."
-          : "Template changed; saved note has no template snapshot, resuming with the current template.",
+          ? getString("note-generator-deep-read-template-changed-resume-saved")
+          : getString(
+              "note-generator-deep-read-template-changed-resume-current",
+            ),
         "warning",
       );
     }
@@ -1080,7 +1189,7 @@ export class NoteGenerator {
     );
     if (!sequentialPhase || sequentialPhase.type !== "sequential_dynamic") {
       throw new Error(
-        "AI \u7cbe\u8bfb\u6a21\u677f\u7f3a\u5c11 sequential_dynamic \u9636\u6bb5",
+        getString("note-generator-error-template-missing-sequential"),
       );
     }
 
@@ -1108,23 +1217,37 @@ export class NoteGenerator {
     if (params.outputWindow) {
       params.outputWindow.startItem(params.itemTitle);
       params.outputWindow.appendContent(
-        "## AI 精读：双阶段逐章阅读\n\nAI 会先解析章节结构，再按章节顺序逐章精读，最后执行重点追问。\n\n",
+        getString("note-generator-deep-read-intro") + "\n\n",
       );
     }
 
     if (!chapters.length) {
       const planningPrompt = sequentialPhase.planningPrompt;
-      params.outputWindow?.appendContent("### 正在解析章节结构\n\n");
       params.outputWindow?.appendContent(
-        `**章节解析提示词：**\n\n${planningPrompt}\n\n`,
+        getString("note-generator-deep-read-parsing-heading") + "\n\n",
       );
-      params.progressCallback?.("正在解析章节结构...", 45);
+      params.outputWindow?.appendContent(
+        getString("note-generator-deep-read-planning-prompt-label", {
+          args: { prompt: planningPrompt },
+        }) + "\n\n",
+      );
+      params.progressCallback?.(
+        getString("progress-deepread-parsing-message"),
+        45,
+        {
+          stage: "deepread-planning",
+          label: getString("progress-deepread-planning"),
+          detail: getString("progress-deepread-parsing-detail"),
+        },
+      );
       const planningResponse = await this.callDeepReadChat({
         session,
         pdfContent: params.pdfContent,
         isBase64: params.isBase64,
         conversation: [{ role: "user", content: planningPrompt }],
         abortSignal: params.abortSignal,
+        onStatus: (event) =>
+          this.forwardLLMStatus(params.progressCallback, event),
       });
       lastResponse = planningResponse;
       const parsedChapters = parseChapterStructureResult(planningResponse.text);
@@ -1134,19 +1257,29 @@ export class NoteGenerator {
           : parsedChapters.chapters;
       if (parsedChapters.source === "regex") {
         this.showDeepReadNotice(
-          "章节 JSON 解析失败，已使用正则兜底识别章节。",
+          getString("note-generator-deep-read-chapter-json-fallback"),
           "warning",
         );
       }
       if (parsedChapters.source === "fallback") {
         this.showDeepReadNotice(
-          "章节解析失败，已使用手动输入或默认章节兜底。",
+          getString("note-generator-deep-read-chapter-manual-fallback"),
           "warning",
         );
       }
     } else {
-      params.outputWindow?.appendContent("### 从现有精读笔记恢复章节结构\n\n");
-      params.progressCallback?.("正在从已有笔记恢复精读进度...", 45);
+      params.outputWindow?.appendContent(
+        getString("note-generator-deep-read-resume-heading") + "\n\n",
+      );
+      params.progressCallback?.(
+        getString("progress-deepread-resuming-message"),
+        45,
+        {
+          stage: "deepread-planning",
+          label: getString("progress-deepread-resuming"),
+          detail: getString("progress-deepread-resuming-detail"),
+        },
+      );
     }
 
     const planned = planDeepReadSlots(template, chapters);
@@ -1156,16 +1289,80 @@ export class NoteGenerator {
 
     if (params.outputWindow) {
       params.outputWindow.appendContent(
-        `识别到章节：${chapters
-          .map(
-            (chapter) =>
-              `${chapter.title_zh}（${chapter.title_en || "无英文标题"}）`,
-          )
-          .join("、")}\n\n`,
+        getString("note-generator-deep-read-detected-chapters", {
+          args: {
+            chapters: chapters
+              .map((chapter) =>
+                getString("note-generator-deep-read-chapter-pair", {
+                  args: {
+                    zh: chapter.title_zh,
+                    en:
+                      chapter.title_en ||
+                      getString("note-generator-deep-read-no-english-title"),
+                  },
+                }),
+              )
+              .join(getString("list-separator")),
+          },
+        }) + "\n\n",
       );
     }
 
     const progressSlots = planned.slots;
+    const totalDeepReadStages = Math.max(progressSlots.length, 1);
+    const slotOrdinal = new Map<string, number>(
+      progressSlots.map((slot, index) => [slot.id, index + 1]),
+    );
+    const getDeepReadSlotProgress = (slot: DeepReadSlot, done = false) => {
+      const ordinal = slotOrdinal.get(slot.id) || 1;
+      const ratio = (ordinal - (done ? 0 : 1)) / totalDeepReadStages;
+      return Math.min(92, 50 + Math.floor(ratio * 42));
+    };
+    const notifyDeepReadSlotProgress = (
+      slot: DeepReadSlot,
+      labelPrefix: string,
+      done = false,
+    ) => {
+      const ordinal = slotOrdinal.get(slot.id) || 1;
+      const label = getString("note-generator-deep-read-round-label", {
+        args: { current: ordinal, total: totalDeepReadStages },
+      });
+      params.progressCallback?.(
+        `${labelPrefix}：${slot.title}`,
+        getDeepReadSlotProgress(slot, done),
+        {
+          stage: "deepread-round",
+          label,
+          detail: getString("note-generator-deep-read-round-detail", {
+            args: {
+              prefix: labelPrefix,
+              title: slot.title,
+              current: ordinal,
+              total: totalDeepReadStages,
+            },
+          }),
+          currentRound: ordinal,
+          totalRounds: totalDeepReadStages,
+        },
+      );
+    };
+    params.progressCallback?.(
+      getString("note-generator-deep-read-plan-complete", {
+        args: { total: totalDeepReadStages },
+      }),
+      50,
+      {
+        stage: "deepread-planning",
+        label: getString("progress-deepread-initial-round", {
+          args: { total: totalDeepReadStages },
+        }),
+        detail: getString("progress-deepread-plan-detail", {
+          args: { total: totalDeepReadStages },
+        }),
+        currentRound: 0,
+        totalRounds: totalDeepReadStages,
+      },
+    );
     params.outputWindow?.setDeepReadProgressSlots?.(progressSlots);
 
     const skeleton = buildDeepReadSkeletonHtml(
@@ -1263,16 +1460,19 @@ export class NoteGenerator {
       const currentHtml = ((note as any).getNote?.() as string) || "";
       if (isDeepReadSlotDone(currentHtml, slot.id)) {
         this.showDeepReadNotice(
-          "This slot is already done; retry skipped.",
+          getString("note-generator-deep-read-retry-slot-already-done"),
           "success",
         );
         return;
       }
       await markSlotRunning(slot);
+      notifyDeepReadSlotProgress(
+        slot,
+        getString("note-generator-deep-read-slot-retrying"),
+      );
       try {
         const response = await this.callDeepReadChat({
           session,
-          item: params.item,
           pdfContent: params.pdfContent,
           isBase64: params.isBase64,
           conversation: [{ role: "user", content: slot.prompt }],
@@ -1284,6 +1484,11 @@ export class NoteGenerator {
         });
         lastResponse = response;
         await updateSlot(slot, response.text, "done");
+        notifyDeepReadSlotProgress(
+          slot,
+          getString("note-generator-deep-read-slot-retry-complete"),
+          true,
+        );
       } catch (error: any) {
         if (isAbortError(error, params.abortSignal)) throw error;
         await updateSlot(slot, error?.message || String(error), "error");
@@ -1305,18 +1510,19 @@ export class NoteGenerator {
         if (!shouldRunDeepReadSlot(currentHtml, slot.id, slot)) continue;
 
         throwIfAborted(params.abortSignal);
-        params.progressCallback?.(
-          `\u6b63\u5728\u7cbe\u8bfb\uff1a${slot.title}`,
-          55 +
-            Math.floor(
-              (index / Math.max(1, planned.sequentialSlots.length)) * 20,
-            ),
+        notifyDeepReadSlotProgress(
+          slot,
+          getString("note-generator-deep-read-slot-reading"),
         );
         params.outputWindow?.appendContent(
-          `### \u6b63\u5728\u7cbe\u8bfb\uff1a${slot.title}\n\n`,
+          getString("note-generator-deep-read-reading-heading", {
+            args: { title: slot.title },
+          }) + "\n\n",
         );
         params.outputWindow?.appendContent(
-          `**\u672c\u7ae0\u63d0\u793a\u8bcd\uff1a**\n\n${slot.prompt}\n\n`,
+          getString("note-generator-deep-read-slot-prompt-label", {
+            args: { prompt: slot.prompt },
+          }) + "\n\n",
         );
 
         const userPrompt =
@@ -1334,7 +1540,6 @@ export class NoteGenerator {
         try {
           const response = await this.callDeepReadChat({
             session,
-            item: params.item,
             pdfContent: params.pdfContent,
             isBase64: params.isBase64,
             conversation,
@@ -1350,6 +1555,11 @@ export class NoteGenerator {
           fullHistory.push({ role: "user", content: userPrompt });
           fullHistory.push({ role: "assistant", content: response.text });
           await updateSlot(slot, response.text, "done");
+          notifyDeepReadSlotProgress(
+            slot,
+            getString("note-generator-deep-read-slot-reading-complete"),
+            true,
+          );
         } catch (error: any) {
           if (
             isAbortError(error, params.abortSignal) ||
@@ -1357,6 +1567,11 @@ export class NoteGenerator {
           )
             throw error;
           await updateSlot(slot, error?.message || String(error), "error");
+          notifyDeepReadSlotProgress(
+            slot,
+            getString("note-generator-deep-read-slot-reading-failed"),
+            true,
+          );
         }
       }
 
@@ -1369,25 +1584,25 @@ export class NoteGenerator {
         if (!shouldRunDeepReadSlot(currentHtml, slot.id, slot)) return;
 
         throwIfAborted(params.abortSignal);
-        params.progressCallback?.(
-          `\u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}`,
-          78 +
-            Math.floor(
-              (index / Math.max(1, planned.independentSlots.length)) * 12,
-            ),
+        notifyDeepReadSlotProgress(
+          slot,
+          getString("note-generator-deep-read-slot-followup"),
         );
         params.outputWindow?.appendContent(
-          `### \u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}\n\n`,
+          getString("note-generator-deep-read-followup-heading", {
+            args: { title: slot.title },
+          }) + "\n\n",
         );
         params.outputWindow?.appendContent(
-          `**\u8ffd\u95ee\u63d0\u793a\u8bcd\uff1a**\n\n${slot.prompt}\n\n`,
+          getString("note-generator-deep-read-followup-prompt-label", {
+            args: { prompt: slot.prompt },
+          }) + "\n\n",
         );
 
         await markSlotRunning(slot);
         try {
           const response = await this.callDeepReadChat({
             session,
-            item: params.item,
             pdfContent: params.pdfContent,
             isBase64: params.isBase64,
             conversation: [{ role: "user", content: slot.prompt }],
@@ -1406,6 +1621,11 @@ export class NoteGenerator {
             params.outputWindow?.appendContent(response.text);
           }
           await updateSlot(slot, response.text, "done");
+          notifyDeepReadSlotProgress(
+            slot,
+            getString("note-generator-deep-read-slot-followup-complete"),
+            true,
+          );
         } catch (error: any) {
           if (
             isAbortError(error, params.abortSignal) ||
@@ -1413,6 +1633,11 @@ export class NoteGenerator {
           )
             throw error;
           await updateSlot(slot, error?.message || String(error), "error");
+          notifyDeepReadSlotProgress(
+            slot,
+            getString("note-generator-deep-read-slot-followup-failed"),
+            true,
+          );
         }
       };
 
@@ -1435,6 +1660,36 @@ export class NoteGenerator {
             await runIndependentSlot(batch[0], batchStartIndex, true);
             continue;
           }
+          const firstOrdinal =
+            slotOrdinal.get(batch[0]?.id || "") || batchStartIndex + 1;
+          const lastOrdinal = Math.min(
+            totalDeepReadStages,
+            firstOrdinal + batch.length - 1,
+          );
+          params.progressCallback?.(
+            getString("note-generator-deep-read-parallel-followup", {
+              args: { titles: batch.map((slot) => slot.title).join("、") },
+            }),
+            50 + Math.floor(((firstOrdinal - 1) / totalDeepReadStages) * 42),
+            {
+              stage: "deepread-round",
+              label: getString("progress-deepread-parallel-rounds", {
+                args: {
+                  first: firstOrdinal,
+                  last: lastOrdinal,
+                  total: totalDeepReadStages,
+                },
+              }),
+              detail: getString("progress-deepread-batch-detail", {
+                args: {
+                  count: batch.length,
+                  titles: batch.map((slot) => slot.title).join("、"),
+                },
+              }),
+              currentRound: firstOrdinal,
+              totalRounds: totalDeepReadStages,
+            },
+          );
           const results = await Promise.allSettled(
             batch.map((slot, offset) =>
               runIndependentSlot(slot, batchStartIndex + offset, false),
@@ -1491,8 +1746,8 @@ export class NoteGenerator {
     const text = { value: "" } as any;
     const ok = Services.prompt.prompt(
       win,
-      "手动输入章节结构",
-      "章节解析失败。请每行输入一个章节，例如：第1章：Introduction",
+      getString("note-generator-manual-chapters-title"),
+      getString("note-generator-manual-chapters-message"),
       text,
       "",
       { value: false },
@@ -1507,7 +1762,11 @@ export class NoteGenerator {
     type: "success" | "warning" | "fail" = "warning",
   ): void {
     try {
-      new ztoolkit.ProgressWindow("AI 精读").createLine({ text, type }).show();
+      new ztoolkit.ProgressWindow(
+        getString("note-generator-deep-read-window-title"),
+      )
+        .createLine({ text, type })
+        .show();
     } catch {
       ztoolkit.log(`[AI-Butler] ${text}`);
     }
@@ -1532,30 +1791,27 @@ export class NoteGenerator {
 
   private static async callDeepReadChat(params: {
     session?: DeepReadSession;
-    item?: Zotero.Item;
     pdfContent: string;
     isBase64: boolean;
     conversation: Array<{ role: "user" | "assistant"; content: string }>;
     abortSignal?: LLMAbortSignal;
     onProgress?: (chunk: string) => void;
+    onStatus?: (event: LLMLifecycleEvent) => void;
   }): Promise<LLMResponse> {
-    const content = params.item
-      ? {
-          kind: "zotero-item" as const,
-          item: params.item,
-          attachmentMode: "default" as const,
-        }
-      : {
-          kind: "legacy" as const,
-          content: params.pdfContent,
-          isBase64: params.isBase64,
-          policy: params.isBase64 ? ("pdf-base64" as const) : ("text" as const),
-        };
+    const content = {
+      kind: "legacy" as const,
+      content: params.pdfContent,
+      isBase64: params.isBase64,
+      policy: params.isBase64 ? ("pdf-base64" as const) : ("text" as const),
+    };
     let conversation = params.conversation;
     let response = await this.chatWithDeepReadSession(params.session, {
       content,
       conversation,
-      transport: { abortSignal: params.abortSignal },
+      transport: {
+        abortSignal: params.abortSignal,
+        onStatus: params.onStatus,
+      },
       onProgress: params.onProgress,
     });
     let text = response.text;
@@ -1576,7 +1832,10 @@ export class NoteGenerator {
       const continuation = await this.chatWithDeepReadSession(params.session, {
         content,
         conversation,
-        transport: { abortSignal: params.abortSignal },
+        transport: {
+          abortSignal: params.abortSignal,
+          onStatus: params.onStatus,
+        },
         onProgress: params.onProgress,
       });
       response = { ...continuation, text: text + "\n\n" + continuation.text };
@@ -1716,7 +1975,13 @@ export class NoteGenerator {
           total,
           total,
           100,
-          `已停止 (已完成 ${successCount} 个，失败 ${failedCount} 个，未处理 ${notProcessed} 个)`,
+          getString("note-generator-batch-stopped", {
+            args: {
+              success: successCount,
+              failed: failedCount,
+              pending: notProcessed,
+            },
+          }),
         );
       } else {
         // 正常完成的情况
@@ -1726,15 +1991,27 @@ export class NoteGenerator {
 
         // 根据成功/失败情况生成不同的完成消息
         if (failedCount === 0) {
-          progressCallback?.(total, total, 100, "所有条目处理完成");
+          progressCallback?.(
+            total,
+            total,
+            100,
+            getString("note-generator-batch-all-completed"),
+          );
         } else if (successCount === 0) {
-          progressCallback?.(total, total, 100, "所有条目处理失败");
+          progressCallback?.(
+            total,
+            total,
+            100,
+            getString("note-generator-batch-all-failed"),
+          );
         } else {
           progressCallback?.(
             total,
             total,
             100,
-            `${successCount} 个成功，${failedCount} 个失败`,
+            getString("note-generator-batch-partial-complete", {
+              args: { success: successCount, failed: failedCount },
+            }),
           );
         }
       }

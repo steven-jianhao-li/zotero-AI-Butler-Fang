@@ -4,16 +4,13 @@ import {
   type NoteTag,
 } from "./aiNoteClassifier";
 import { TaskQueueManager, type TaskType } from "./taskQueue";
+import { getString } from "../utils/locale";
 
 export type CollectionAiNoteCleanScope = "summary" | "all";
 export type CollectionAiNoteCleanAction = "delete" | "deleteAndRegenerate";
 
 export type RegeneratableAiNoteType =
-  | "summary"
-  | "deepRead"
-  | "imageSummary"
-  | "mindmap"
-  | "tableFill";
+  "summary" | "deepRead" | "imageSummary" | "mindmap" | "tableFill";
 export type CleanableAiNoteType = RegeneratableAiNoteType | "chat";
 
 export interface CollectionAiNoteRecord {
@@ -77,6 +74,18 @@ const EMPTY_REGENERATABLE_COUNTS: Record<RegeneratableAiNoteType, number> = {
   tableFill: 0,
 };
 
+const COLLECTION_CLEAN_TYPE_LABEL_KEYS: Record<
+  CleanableAiNoteType,
+  Parameters<typeof getString>[0]
+> = {
+  summary: "collection-clean-type-summary",
+  deepRead: "collection-clean-type-deepRead",
+  imageSummary: "collection-clean-type-imageSummary",
+  mindmap: "collection-clean-type-mindmap",
+  tableFill: "collection-clean-type-tableFill",
+  chat: "collection-clean-type-chat",
+};
+
 function isRegeneratableNoteType(
   type: AiButlerNoteType | null,
 ): type is RegeneratableAiNoteType {
@@ -118,18 +127,15 @@ function getScopeTypes(
 }
 
 function getItemTitle(item: Zotero.Item): string {
-  return String(item.getField("title") || "未命名文献");
+  return String(
+    item.getField("title") || getString("collection-clean-untitled-item"),
+  );
 }
 
 export class CollectionAiNoteCleaner {
-  public static readonly TYPE_LABELS: Record<CleanableAiNoteType, string> = {
-    summary: "AI 总结",
-    deepRead: "AI 精读",
-    imageSummary: "一图总结",
-    mindmap: "思维导图",
-    tableFill: "填表笔记",
-    chat: "后续追问记录",
-  };
+  public static getTypeLabel(type: CleanableAiNoteType): string {
+    return getString(COLLECTION_CLEAN_TYPE_LABEL_KEYS[type]);
+  }
 
   public static async inspectCollection(
     collection: Zotero.Collection,
@@ -227,7 +233,11 @@ export class CollectionAiNoteCleaner {
           note as unknown as { eraseTx?: () => Promise<boolean | void> }
         ).eraseTx;
         if (!eraseTx) {
-          throw new Error(`笔记 ${noteRecord.noteId} 不支持删除`);
+          throw new Error(
+            getString("collection-clean-error-note-delete-unsupported", {
+              args: { id: noteRecord.noteId },
+            }),
+          );
         }
         await eraseTx.call(note);
         deletedNotes += 1;

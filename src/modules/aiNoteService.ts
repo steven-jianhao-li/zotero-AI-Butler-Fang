@@ -4,17 +4,20 @@
   SUMMARY_NOTE_TAG,
   isDeepReadNote,
   isFollowUpChatNote,
+  isMisTaggedDeepReadSummaryNote,
   isRegularSummaryNote,
   type NoteTag,
 } from "./aiNoteClassifier";
 import {
   buildFollowUpChatPairNoteHtml,
   normalizeFollowUpChatNoteHtml,
+  removeFollowUpChatPairFromNoteHtml,
 } from "./noteMarkdown";
 import {
   LLMNoteMetadataService,
   type LLMNoteMetadata,
 } from "./llmNoteMetadata";
+import { getString } from "../utils/locale";
 
 export type AiNoteKind = "summary" | "deepRead";
 
@@ -28,16 +31,16 @@ const NOTE_KIND_TAG: Record<AiNoteKind, string> = {
   deepRead: DEEP_READ_NOTE_TAG,
 };
 
-const NOTE_KIND_TITLE: Record<AiNoteKind, string> = {
-  summary: "AI 总结",
-  deepRead: "AI 精读",
+const NOTE_KIND_TITLE_KEY: Record<AiNoteKind, string> = {
+  summary: "note-kind-summary",
+  deepRead: "note-kind-deep-read",
 };
 
 export class AiNoteService {
   private static noteWriteLocks = new Map<string, Promise<void>>();
 
   public static getTitle(kind: AiNoteKind): string {
-    return NOTE_KIND_TITLE[kind];
+    return getString(NOTE_KIND_TITLE_KEY[kind]);
   }
 
   public static getTag(kind: AiNoteKind): string {
@@ -87,18 +90,23 @@ export class AiNoteService {
             : isDeepReadNote(tags, noteHtml);
         if (!matches) continue;
 
-        if (!target || compareModified(note, target) > 0) {
+        const shouldSelect = !target || compareModified(note, target) > 0;
+        const normalizedHtml = await this.normalizeMatchedNote(
+          note as Zotero.Item,
+          kind,
+          tags,
+          noteHtml,
+        );
+
+        if (shouldSelect) {
           target = note as Zotero.Item;
-          rawHtml = noteHtml;
+          rawHtml = normalizedHtml;
         }
       }
 
       return target ? { note: target, rawHtml } : null;
     } catch (error) {
-      ztoolkit.log(
-        `[AI-Butler] 查找 ${NOTE_KIND_TITLE[kind]} 笔记失败:`,
-        error,
-      );
+      ztoolkit.log(`[AI-Butler] find ${kind} note failed:`, error);
       return null;
     }
   }
@@ -226,16 +234,11 @@ export class AiNoteService {
       await this.findLegacyChatNote(item),
     ].filter((note): note is Zotero.Item => !!note);
 
-    const startMarker = `<!-- AI_BUTLER_CHAT_PAIR_START id=${pairId} -->`;
-    const endMarker = `<!-- AI_BUTLER_CHAT_PAIR_END id=${pairId} -->`;
-
     for (const note of notes) {
-      let html = (note as any).getNote?.() || "";
-      const startIdx = html.indexOf(startMarker);
-      const endIdx = html.indexOf(endMarker);
-      if (startIdx === -1 || endIdx === -1) continue;
-      html = html.slice(0, startIdx) + html.slice(endIdx + endMarker.length);
-      (note as any).setNote(html);
+      const html = (note as any).getNote?.() || "";
+      const updatedHtml = removeFollowUpChatPairFromNoteHtml(html, pairId);
+      if (updatedHtml === html) continue;
+      (note as any).setNote(updatedHtml);
       await (note as any).saveTx();
     }
   }
@@ -248,11 +251,15 @@ export class AiNoteService {
       const existing = await this.findNote(parentItem, "deepRead");
       if (existing) return existing;
 
-      const title = (parentItem.getField("title") as string) || "文献";
+      const title =
+        (parentItem.getField("title") as string) ||
+        getString("common-paper-title");
       const note = new Zotero.Item("note");
       note.libraryID = parentItem.libraryID;
       note.parentID = parentItem.id;
-      note.setNote(`<h1>AI 精读 - ${escapeHtml(title)}</h1>`);
+      note.setNote(
+        `<h1>${getString("deep-read-note-title", { args: { title: escapeHtml(title) } })}</h1>`,
+      );
       note.addTag(DEEP_READ_NOTE_TAG);
       await note.saveTx();
       return note;
@@ -288,6 +295,66 @@ export class AiNoteService {
     if (!tags.some((entry) => entry.tag === tag)) {
       note.addTag(tag);
     }
+  }
+
+  private static async normalizeMatchedNote(
+    note: Zotero.Item,
+    kind: AiNoteKind,
+    tags: NoteTag[],
+    noteHtml: string,
+  ): Promise<string> {
+    if (kind !== "summary") return noteHtml;
+
+    let changed = false;
+    let normalizedHtml = noteHtml;
+    if (!tags.some((entry) => entry.tag === SUMMARY_NOTE_TAG)) {
+      note.addTag(SUMMARY_NOTE_TAG);
+      changed = true;
+    }
+
+    if (isMisTaggedDeepReadSummaryNote(tags, noteHtml)) {
+      if (tags.some((entry) => entry.tag === DEEP_READ_NOTE_TAG)) {
+        this.removeTag(note, DEEP_READ_NOTE_TAG, tags);
+        changed = true;
+      }
+
+      normalizedHtml = this.renameLegacySummaryHeading(normalizedHtml);
+      if (normalizedHtml !== noteHtml) {
+        (note as any).setNote?.(normalizedHtml);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      try {
+        await (note as any).saveTx?.();
+      } catch (error) {
+        ztoolkit.log("[AI-Butler] normalize summary note failed:", error);
+      }
+    }
+    return normalizedHtml;
+  }
+
+  private static removeTag(
+    note: Zotero.Item,
+    tag: string,
+    currentTags: NoteTag[],
+  ): void {
+    const noteApi = note as any;
+    if (typeof noteApi.removeTag === "function") {
+      noteApi.removeTag(tag);
+      return;
+    }
+    if (typeof noteApi.setTags === "function") {
+      noteApi.setTags(currentTags.filter((entry) => entry.tag !== tag));
+    }
+  }
+
+  private static renameLegacySummaryHeading(html: string): string {
+    return html.replace(
+      /<h2>\s*AI\s*\u7ba1\u5bb6\s*-\s*/,
+      `<h2>${getString("note-kind-summary")} - `,
+    );
   }
 }
 

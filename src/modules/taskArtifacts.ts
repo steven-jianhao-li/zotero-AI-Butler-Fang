@@ -6,11 +6,7 @@ import { AiNoteService } from "./aiNoteService";
 import { hasIncompleteDeepReadContent } from "./deepReadEngine";
 
 export type FixedTaskArtifactType =
-  | "summary"
-  | "deepRead"
-  | "imageSummary"
-  | "mindmap"
-  | "tableFill";
+  "summary" | "deepRead" | "imageSummary" | "mindmap" | "tableFill";
 
 export interface TaskArtifactProbeResult {
   exists: boolean;

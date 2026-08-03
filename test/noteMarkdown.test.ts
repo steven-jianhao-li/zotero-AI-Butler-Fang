@@ -4,12 +4,31 @@ import {
   decodeMathHtmlEntities,
   markdownToDisplayHtml,
   markdownToZoteroNoteHtml,
+  normalizeLatexForKatex,
+  requiresDisplayMath,
+  stripMathDelimiters,
   normalizeFollowUpChatNoteHtml,
   parseFollowUpChatPairsFromNoteHtml,
+  removeFollowUpChatPairFromNoteHtml,
 } from "../src/modules/noteMarkdown";
 import { buildQuickChatConversation } from "../src/modules/chatContext";
+import {
+  LLMNoteMetadataService,
+  type LLMNoteMetadata,
+} from "../src/modules/llmNoteMetadata";
 
 describe("note Markdown rendering", function () {
+  const chatMetadata = (blockId: string): LLMNoteMetadata => ({
+    schema: "AI_BUTLER_LLM_NOTE_BLOCK",
+    version: 1,
+    blockId,
+    task: "chat",
+    providerId: "openai-compat",
+    providerName: "OpenAI-compatible",
+    modelId: "test-model",
+    generatedAt: "2026-07-20T00:00:00.000Z",
+  });
+
   it("renders saved follow-up headings and formulas (#307, #264)", function () {
     const html = markdownToZoteroNoteHtml(
       "## Follow-up answer\n\nMass energy: $E=mc^2$.\n\n$$\na_b = c^2\n$$",
@@ -17,7 +36,8 @@ describe("note Markdown rendering", function () {
 
     expect(html).to.contain("<h2>Follow-up answer</h2>");
     expect(html).to.contain('<span class="math">$E=mc^2$</span>');
-    expect(html).to.contain("\\displaystyle a_b = c^2");
+    expect(html).to.contain(`<pre class="math"`);
+    expect(html).to.contain(`$$a_b = c^2$$`);
     expect(html).not.to.contain("## Follow-up answer");
   });
 
@@ -25,6 +45,46 @@ describe("note Markdown rendering", function () {
     const html = markdownToZoteroNoteHtml("Compare $a < b & c$ safely.");
 
     expect(html).to.contain('<span class="math">$a &lt; b &amp; c$</span>');
+  });
+
+  it("keeps tagged equations in display math mode (#346)", function () {
+    const formula = String.raw`\mathbf{z}_{NAN} = \mathbf{z}_{1} \cdot \mathbf{z}_{0}^{-1}, \tag{1}`;
+    const noteHtml = markdownToZoteroNoteHtml(`$${formula}$`);
+    const displayHtml = markdownToDisplayHtml(`$${formula}$`);
+
+    expect(requiresDisplayMath(formula)).to.equal(true);
+    expect(noteHtml).to.contain(`<pre class="math"`);
+    expect(noteHtml).to.contain(`$$${formula}$$`);
+    expect(noteHtml).not.to.contain(`<p><pre`);
+    expect(noteHtml).not.to.contain(`<span class="math">$${formula}$</span>`);
+    expect(noteHtml).not.to.contain("\\displaystyle");
+    expect(displayHtml).to.contain('class="katex-display"');
+    expect(displayHtml).not.to.contain("katex-error");
+  });
+
+  it("normalizes escaped angle brackets before KaTeX rendering", function () {
+    const formula = String.raw`\text {pairflow} := &lt; C _ {I P}, S _ {I P}, t &gt;`;
+    const normalized = normalizeLatexForKatex(formula);
+    const html = markdownToDisplayHtml(`$${formula}$`);
+
+    expect(normalized).to.contain("\\langle");
+    expect(normalized).to.contain("\\rangle");
+    expect(html).to.contain('class="katex-inline"');
+    expect(html).to.contain("pairflow");
+    expect(html).to.contain("C");
+    expect(html).not.to.contain("math-fallback");
+  });
+
+  it("strips accidental triple-dollar delimiters in display math", function () {
+    const formula = String.raw`\text{最小流量} = 2900 \ \frac{\text{包}}{\text{秒}} \approx 180 \ \text{Gbps}`;
+    const noteHtml = markdownToZoteroNoteHtml(`$$$${formula}$$$`);
+    const displayHtml = markdownToDisplayHtml(`$$$${formula}$$$`);
+
+    expect(stripMathDelimiters(`$${formula}$`)).to.equal(formula);
+    expect(noteHtml).to.contain(`$$${formula}$$`);
+    expect(noteHtml).not.to.contain(`$$$${formula}$$$`);
+    expect(displayHtml).to.contain('class="katex-display"');
+    expect(displayHtml).not.to.contain("math-fallback");
   });
 
   it("keeps text after headings and block formulas as paragraphs", function () {
@@ -79,6 +139,33 @@ describe("note Markdown rendering", function () {
     expect(html).to.contain('class="katex-display"');
     expect(html).to.contain("katex-html");
     expect(html).not.to.contain('<span class="math">');
+  });
+
+  it("wraps display KaTeX in a scroll container for narrow UI panes", function () {
+    const html = markdownToDisplayHtml(
+      String.raw`$$\boxed{\begin{aligned}\text{PAF}_{\rm TsuKing}&=\frac{1}{P_{\rm in}}\mathbf{N}^{\!\top}\mathbf{A}\\&\approx 6.7\times10^{9}\end{aligned}}$$`,
+    );
+
+    expect(html).to.contain('class="katex-scroll-container"');
+    expect(html).to.contain('class="katex-display"');
+    expect(html).not.to.contain("math-fallback");
+    expect(html).not.to.contain("katex-error");
+  });
+
+  it("strips XML-invalid clipboard controls before rendering (#347)", function () {
+    const pastedText = ["·ccc", "\u000Bddd", "正常保留换行\t和制表符"].join(
+      "\n",
+    );
+
+    const displayHtml = markdownToDisplayHtml(pastedText);
+    const noteHtml = markdownToZoteroNoteHtml(pastedText);
+
+    expect(displayHtml).to.contain("·ccc");
+    expect(displayHtml).to.contain("ddd");
+    expect(displayHtml).not.to.contain("\u000B");
+    expect(noteHtml).to.contain("·ccc");
+    expect(noteHtml).to.contain("ddd");
+    expect(noteHtml).not.to.contain("\u000B");
   });
 
   it("builds quick-chat context from the current dialog only", function () {
@@ -138,6 +225,69 @@ describe("note Markdown rendering", function () {
     ]);
   });
 
+  it("restores saved follow-up chats when Zotero strips HTML comments (#379)", function () {
+    const html = buildFollowUpChatPairNoteHtml({
+      pairId: "pair_379",
+      userMessage: "为什么后续追问没有保留下来？",
+      assistantMessage: '需要保留 {"role":"assistant"} 和箭头 --> 内容。',
+      savedAt: "2026/7/20 12:10:56",
+    });
+    const strippedByZotero = html.replace(/<!--[\s\S]*?-->/g, "");
+
+    expect(strippedByZotero).to.contain("data-ai-butler-chat-json");
+    expect(parseFollowUpChatPairsFromNoteHtml(strippedByZotero)).to.deep.equal([
+      {
+        id: "pair_379",
+        user: "为什么后续追问没有保留下来？",
+        assistant: '需要保留 {"role":"assistant"} 和箭头 --> 内容。',
+      },
+    ]);
+  });
+
+  it("restores metadata-wrapped follow-up chats when comments are stripped (#379)", function () {
+    const html = buildFollowUpChatPairNoteHtml({
+      pairId: "pair_379_meta",
+      userMessage: "metadata question",
+      assistantMessage: "metadata answer",
+    });
+    const wrapped = LLMNoteMetadataService.wrapHtml(
+      html,
+      chatMetadata("chat-block-379"),
+    );
+    const strippedByZotero = wrapped.replace(/<!--[\s\S]*?-->/g, "");
+
+    expect(parseFollowUpChatPairsFromNoteHtml(strippedByZotero)).to.deep.equal([
+      {
+        id: "pair_379_meta",
+        user: "metadata question",
+        assistant: "metadata answer",
+      },
+    ]);
+
+    const updated = removeFollowUpChatPairFromNoteHtml(
+      strippedByZotero,
+      "pair_379_meta",
+    );
+    expect(parseFollowUpChatPairsFromNoteHtml(updated)).to.deep.equal([]);
+    expect(updated).not.to.contain("data-ai-butler-llm-source");
+  });
+
+  it("does not duplicate follow-up chats when both comments and visible data exist", function () {
+    const html = buildFollowUpChatPairNoteHtml({
+      pairId: "pair_no_dup",
+      userMessage: "question",
+      assistantMessage: "answer",
+    });
+
+    expect(parseFollowUpChatPairsFromNoteHtml(html)).to.deep.equal([
+      {
+        id: "pair_no_dup",
+        user: "question",
+        assistant: "answer",
+      },
+    ]);
+  });
+
   it("parses legacy follow-up JSON comments that contain braces", function () {
     const html = `<!-- AI_BUTLER_CHAT_JSON: {"id":"legacy_178","user":"Why {this}?","assistant":"Because {that}."} -->`;
 
@@ -150,6 +300,31 @@ describe("note Markdown rendering", function () {
         assistant: "Because {that}.",
       },
     ]);
+  });
+
+  it("recovers legacy visible follow-up blocks when comments were stripped", function () {
+    const legacyVisibleOnly = `
+<div id="ai-butler-pair-legacy_visible" style="margin-top:14px; padding-top:8px; border-top:1px dashed #ccc;">
+  <div style="background-color:#e3f2fd; padding:10px; border-radius:6px; margin-bottom:8px;"><strong>👤 用户:</strong> Legacy question?</div>
+  <div style="background-color:#f5f5f5; padding:10px; border-radius:6px;"><strong>🤖 AI管家:</strong><br/><p>Legacy answer.</p></div>
+  <div style="font-size:11px; color:#999; margin-top:6px;">保存时间: 2026/7/20</div>
+</div>`;
+
+    expect(parseFollowUpChatPairsFromNoteHtml(legacyVisibleOnly)).to.deep.equal(
+      [
+        {
+          id: "legacy_visible",
+          user: "Legacy question?",
+          assistant: "Legacy answer.",
+        },
+      ],
+    );
+
+    const updated = removeFollowUpChatPairFromNoteHtml(
+      legacyVisibleOnly,
+      "legacy_visible",
+    );
+    expect(parseFollowUpChatPairsFromNoteHtml(updated)).to.deep.equal([]);
   });
 
   it("normalizes legacy follow-up chat blocks for dark notes (#193)", function () {
@@ -169,5 +344,36 @@ describe("note Markdown rendering", function () {
     expect(normalized).not.to.contain("background-color:#e3f2fd");
     expect(normalized).not.to.contain("background-color:#f5f5f5");
     expect(normalized).not.to.contain("color:#999");
+  });
+
+  it("removes saved follow-up pairs even after comment metadata is stripped", function () {
+    const first = buildFollowUpChatPairNoteHtml({
+      pairId: "pair_keep",
+      userMessage: "keep question",
+      assistantMessage: "keep answer",
+    });
+    const second = buildFollowUpChatPairNoteHtml({
+      pairId: "pair_remove",
+      userMessage: "remove question",
+      assistantMessage: "remove answer",
+    });
+    const strippedByZotero = `${first}${second}`.replace(
+      /<!--[\s\S]*?-->/g,
+      "",
+    );
+
+    const updated = removeFollowUpChatPairFromNoteHtml(
+      strippedByZotero,
+      "pair_remove",
+    );
+
+    expect(parseFollowUpChatPairsFromNoteHtml(updated)).to.deep.equal([
+      {
+        id: "pair_keep",
+        user: "keep question",
+        assistant: "keep answer",
+      },
+    ]);
+    expect(updated).not.to.contain("remove question");
   });
 });

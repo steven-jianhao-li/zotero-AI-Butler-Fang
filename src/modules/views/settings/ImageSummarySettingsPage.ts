@@ -8,6 +8,7 @@
  */
 
 import { getPref, setPref } from "../../../utils/prefs";
+import { getString } from "../../../utils/locale";
 import {
   createStyledButton,
   createFormGroup,
@@ -21,6 +22,8 @@ import {
 import {
   getDefaultImageSummaryPrompt,
   getDefaultImageGenerationPrompt,
+  getConfiguredImageSummaryPrompt,
+  getConfiguredImageGenerationPrompt,
 } from "../../../utils/prompts";
 import { ImageClient, ImageGenerationError } from "../../imageClient";
 
@@ -42,48 +45,47 @@ export class ImageSummarySettingsPage {
     this.container.innerHTML = "";
     this.endpointPreviewUpdaters = [];
 
-    // 标题
-    const title = this.createElement("h2", {
-      textContent: "🖼️ 一图总结设置",
-      styles: {
-        color: "#9c27b0",
-        marginBottom: "20px",
-        fontSize: "20px",
-        borderBottom: "2px solid #9c27b0",
-        paddingBottom: "10px",
-      },
-    });
+    const title = this.createPageTitle(
+      getString("settings-image-summary-title"),
+    );
     this.container.appendChild(title);
 
-    // 功能说明
-    const notice = createNotice(
-      "📝 <strong>功能说明</strong>：一图总结使用生图模型 (默认 gemini-3-pro-image-preview) 为论文生成学术概念海报，支持 Gemini 原生接口与 OpenAI 兼容接口两种请求方式。",
-      "info",
+    this.container.appendChild(
+      createNotice(getString("settings-image-summary-description"), "info"),
     );
-    this.container.appendChild(notice);
 
-    // 表单容器
     const form = this.createElement("div", {
       styles: {
-        maxWidth: "800px",
+        maxWidth: "880px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "16px",
       },
     });
 
-    // === API 配置区域 ===
-    form.appendChild(createSectionTitle("🔌 API 配置"));
+    form.appendChild(this.createPresetPanel());
 
-    // 请求方式
+    const apiCard = this.createSettingsCard(
+      getString("settings-image-summary-api-title"),
+      getString("settings-image-summary-api-description"),
+    );
+
     const requestModeValue =
       (getPref("imageSummaryRequestMode" as any) as string) || "gemini";
     const requestModeSelect = createSelect(
       "imageSummaryRequestMode",
       [
-        { value: "gemini", label: "Gemini 原生接口 (x-goog-api-key)" },
-        { value: "openai", label: "OpenAI 兼容接口 (Bearer)" },
+        {
+          value: "gemini",
+          label: getString("settings-image-summary-request-mode-gemini"),
+        },
+        {
+          value: "openai",
+          label: getString("settings-image-summary-request-mode-openai"),
+        },
       ],
       requestModeValue,
       (newVal) => {
-        // 切换时，如 API 地址保持默认且用户尚未手动修改，则自动填充更合适的默认值
         const urlInput = this.container.querySelector(
           "#setting-imageSummaryApiUrl",
         ) as HTMLInputElement | null;
@@ -104,31 +106,29 @@ export class ImageSummarySettingsPage {
         this.refreshEndpointPreviews();
       },
     );
-    form.appendChild(
+    apiCard.body.appendChild(
       createFormGroup(
-        "请求方式",
+        getString("settings-image-summary-request-mode"),
         requestModeSelect,
-        "选择使用 Gemini 原生接口或 OpenAI 兼容接口来调用生图模型",
+        getString("settings-image-summary-request-mode-help"),
       ),
     );
 
-    // API Key
-    form.appendChild(
+    apiCard.body.appendChild(
       createFormGroup(
-        "API Key *",
+        getString("settings-image-summary-api-key-label"),
         this.createPasswordInput(
           "imageSummaryApiKey",
           (getPref("imageSummaryApiKey" as any) as string) || "",
-          "您的 API Key",
+          getString("settings-image-summary-api-key-placeholder"),
         ),
-        "【必填】Gemini 模式使用 x-goog-api-key；OpenAI 模式使用 Authorization Bearer。",
+        getString("settings-image-summary-api-key-help"),
       ),
     );
 
-    // API Base URL
-    form.appendChild(
+    apiCard.body.appendChild(
       this.createEndpointFormGroup(
-        "API 地址 *",
+        getString("settings-image-summary-api-url"),
         "imageSummaryApiUrl",
         (getPref("imageSummaryApiUrl" as any) as string) ||
           (requestModeValue === "openai"
@@ -140,24 +140,22 @@ export class ImageSummarySettingsPage {
       ),
     );
 
-    // 自定义请求 Header
-    form.appendChild(
+    apiCard.body.appendChild(
       createFormGroup(
-        "额外请求 Headers",
+        getString("settings-image-summary-extra-headers"),
         createTextarea(
           "imageSummaryCustomHeaders",
           (getPref("imageSummaryCustomHeaders" as any) as string) || "",
           4,
           '{"X-ModelScope-Async-Mode": "true"}',
         ),
-        '可选。填写 JSON 或 Python dict 对象，键值会附加到一图总结生图请求；例如 {"X-ModelScope-Async-Mode": "true"}。鉴权和 Content-Type 仍由插件配置管理。',
+        getString("settings-image-summary-extra-headers-help"),
       ),
     );
 
-    // 模型名称
-    form.appendChild(
+    apiCard.body.appendChild(
       createFormGroup(
-        "生图模型",
+        getString("settings-image-summary-model"),
         createInput(
           "imageSummaryModel",
           "text",
@@ -165,7 +163,7 @@ export class ImageSummarySettingsPage {
             "gemini-3-pro-image-preview",
           "gemini-3-pro-image-preview",
         ),
-        "Gemini 推荐 gemini-3-pro-image-preview；OpenAI 兼容生图可填写 gpt-image-2 等模型",
+        getString("settings-image-summary-model-help"),
       ),
     );
 
@@ -177,100 +175,89 @@ export class ImageSummarySettingsPage {
     );
     timeoutInput.min = "30";
     timeoutInput.step = "1";
-    form.appendChild(
+    apiCard.body.appendChild(
       createFormGroup(
-        "生图请求超时时间 (秒)",
+        getString("settings-image-summary-timeout"),
         timeoutInput,
-        "一图总结第二阶段生图请求的超时时间，默认 600 秒 (10 分钟)，最小 30 秒。",
+        getString("settings-image-summary-timeout-help"),
       ),
     );
+    form.appendChild(apiCard.card);
 
-    // === 生成选项区域 ===
-    form.appendChild(createSectionTitle("⚙️ 生成选项"));
+    const generationCard = this.createSettingsCard(
+      getString("settings-image-summary-generation-title"),
+      getString("settings-image-summary-generation-description"),
+    );
 
-    // 图片语言
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "图片语言",
+        getString("settings-image-summary-language"),
         createInput(
           "imageSummaryLanguage",
           "text",
-          (getPref("imageSummaryLanguage" as any) as string) || "中文",
-          "中文",
+          (getPref("imageSummaryLanguage" as any) as string) ||
+            getString("settings-image-summary-default-language"),
+          getString("settings-image-summary-default-language"),
         ),
-        "生成图片中显示的文字语言",
+        getString("settings-image-summary-language-help"),
       ),
     );
 
-    // 启用图片宽高比参数
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "启用宽高比参数",
+        getString("settings-image-summary-enable-aspect-ratio"),
         createCheckbox(
           "imageSummaryAspectRatioEnabled",
           (getPref("imageSummaryAspectRatioEnabled" as any) as boolean) ??
             false,
         ),
-        "Gemini 模式发送 aspectRatio；OpenAI/gpt-image-2 模式会和分辨率一起合成为官方 size 参数。",
+        getString("settings-image-summary-enable-aspect-ratio-help"),
       ),
     );
 
-    // 图片宽高比
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "图片宽高比",
+        getString("settings-image-summary-aspect-ratio"),
         createInput(
           "imageSummaryAspectRatio",
           "text",
           (getPref("imageSummaryAspectRatio" as any) as string) || "16:9",
           "16:9",
         ),
-        "生成图片的宽高比，如 16:9、1:1、9:16、4:3 等；gpt-image-2 的最长边/最短边比例需不超过 3:1。",
+        getString("settings-image-summary-aspect-ratio-help"),
       ),
     );
 
-    // 启用图片分辨率参数
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "启用分辨率参数",
+        getString("settings-image-summary-enable-resolution"),
         createCheckbox(
           "imageSummaryResolutionEnabled",
           (getPref("imageSummaryResolutionEnabled" as any) as boolean) ?? false,
         ),
-        "Gemini 模式发送 imageSize；OpenAI/gpt-image-2 模式会转换为官方 size 参数。",
+        getString("settings-image-summary-enable-resolution-help"),
       ),
     );
 
-    // 图片分辨率
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "图片分辨率",
-        createSelect(
-          "imageSummaryResolution",
-          [
-            { value: "1K", label: "1K (默认)" },
-            { value: "2K", label: "2K" },
-            { value: "4K", label: "4K" },
-          ],
-          (getPref("imageSummaryResolution" as any) as string) || "1K",
-        ),
-        "生成图片的分辨率；OpenAI/gpt-image-2 会映射为合法尺寸，如 16:9 的 1K/2K/4K 对应 1280x720、2048x1152、3840x2160。",
+        getString("settings-image-summary-resolution"),
+        this.createResolutionSetting(),
+        getString("settings-image-summary-resolution-help"),
       ),
     );
 
-    // 使用已有 AI 总结代替
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "使用已有 AI 总结",
+        getString("settings-image-summary-use-existing-note"),
         createCheckbox(
           "imageSummaryUseExistingNote",
           (getPref("imageSummaryUseExistingNote" as any) as boolean) || false,
         ),
-        "开启后，将使用已存在的 AI 管家笔记内容作为视觉摘要输入，可节省 API 调用费用",
+        getString("settings-image-summary-use-existing-note-help"),
       ),
     );
 
-    // 自动添加一图总结（带二次确认）
     const autoSummaryContainer = createCheckbox(
       "autoImageSummaryOnComplete",
       (getPref("autoImageSummaryOnComplete" as any) as boolean) || false,
@@ -285,40 +272,46 @@ export class ImageSummarySettingsPage {
     if (autoSummaryCheckbox) {
       autoSummaryCheckbox.addEventListener("change", () => {
         if (autoSummaryCheckbox.checked) {
-          // 弹出二次确认对话框
           const confirmed = this.showCostWarningDialog();
           if (!confirmed) {
             autoSummaryCheckbox.checked = false;
             if (autoSummaryLabel) {
-              autoSummaryLabel.textContent = "已禁用";
+              autoSummaryLabel.textContent = getString(
+                "settings-image-summary-disabled",
+              );
             }
           } else {
             if (autoSummaryLabel) {
-              autoSummaryLabel.textContent = "已启用";
+              autoSummaryLabel.textContent = getString(
+                "settings-image-summary-enabled",
+              );
             }
-            // 用户确认后自动保存设置
             setPref("autoImageSummaryOnComplete" as any, true);
           }
         } else {
           if (autoSummaryLabel) {
-            autoSummaryLabel.textContent = "已禁用";
+            autoSummaryLabel.textContent = getString(
+              "settings-image-summary-disabled",
+            );
           }
-          // 用户关闭时自动保存设置
           setPref("autoImageSummaryOnComplete" as any, false);
         }
       });
     }
 
-    form.appendChild(
+    generationCard.body.appendChild(
       createFormGroup(
-        "自动添加一图总结",
+        getString("settings-image-summary-auto-add"),
         autoSummaryContainer,
-        "⚠️ 开启后，论文AI总结完成时将自动生成一图总结（可能消耗大量API费用，请谨慎开启）",
+        getString("settings-image-summary-auto-add-help"),
       ),
     );
+    form.appendChild(generationCard.card);
 
-    // === 提示词配置区域 ===
-    form.appendChild(createSectionTitle("📝 提示词配置"));
+    const promptCard = this.createSettingsCard(
+      getString("settings-image-summary-prompt-title"),
+      getString("settings-image-summary-prompt-description"),
+    );
 
     // 变量说明
     const varsNotice = this.createElement("div", {
@@ -332,39 +325,44 @@ export class ImageSummarySettingsPage {
         color: "#e65100",
       },
     });
-    varsNotice.innerHTML =
-      "📌 <strong>可用变量</strong>：<code>${context}</code> 论文内容, <code>${title}</code> 论文标题, <code>${language}</code> 语言设置, <code>${summaryForImage}</code> 视觉摘要结果";
-    form.appendChild(varsNotice);
+    varsNotice.innerHTML = getString(
+      "settings-image-summary-available-variables",
+    );
+    promptCard.body.appendChild(varsNotice);
 
     // 视觉信息提取提示词
-    form.appendChild(
+    promptCard.body.appendChild(
       createFormGroup(
-        "视觉信息提取提示词",
+        getString("settings-image-summary-visual-prompt"),
         createTextarea(
           "imageSummaryPrompt",
-          (getPref("imageSummaryPrompt" as any) as string) ||
-            getDefaultImageSummaryPrompt(),
+          getConfiguredImageSummaryPrompt(
+            getPref("imageSummaryPrompt" as any) as string,
+          ),
           10,
-          "用于从论文中提取视觉信息的提示词...",
+          getString("settings-image-summary-visual-prompt-placeholder"),
         ),
-        "第一阶段：从论文中提取用于生成图片的关键视觉信息",
+        getString("settings-image-summary-visual-prompt-help"),
       ),
     );
 
     // 生图提示词
-    form.appendChild(
+    promptCard.body.appendChild(
       createFormGroup(
-        "生图提示词",
+        getString("settings-image-summary-image-prompt"),
         createTextarea(
           "imageSummaryImagePrompt",
-          (getPref("imageSummaryImagePrompt" as any) as string) ||
-            getDefaultImageGenerationPrompt(),
+          getConfiguredImageGenerationPrompt(
+            getPref("imageSummaryImagePrompt" as any) as string,
+          ),
           12,
-          "用于生成学术概念海报的提示词...",
+          getString("settings-image-summary-image-prompt-placeholder"),
         ),
-        "第二阶段：根据视觉摘要生成学术概念海报图片",
+        getString("settings-image-summary-image-prompt-help"),
       ),
     );
+
+    form.appendChild(promptCard.card);
 
     // 按钮组
     const buttonGroup = this.createElement("div", {
@@ -378,18 +376,26 @@ export class ImageSummarySettingsPage {
     });
 
     // 测试连接按钮
-    const testButton = createStyledButton("🔍 测试 API", "#2196f3", "medium");
+    const testButton = createStyledButton(
+      getString("settings-image-summary-test-api"),
+      "#2196f3",
+      "medium",
+    );
     testButton.addEventListener("click", () => this.testConnection());
     buttonGroup.appendChild(testButton);
 
     // 保存按钮
-    const saveButton = createStyledButton("💾 保存设置", "#4caf50", "medium");
+    const saveButton = createStyledButton(
+      getString("settings-image-summary-save-settings"),
+      "#4caf50",
+      "medium",
+    );
     saveButton.addEventListener("click", () => this.saveSettings());
     buttonGroup.appendChild(saveButton);
 
     // 重置提示词按钮
     const resetButton = createStyledButton(
-      "🔄 重置提示词",
+      getString("settings-image-summary-reset-prompts"),
       "#9e9e9e",
       "medium",
     );
@@ -421,7 +427,7 @@ export class ImageSummarySettingsPage {
       },
     });
     const resultTitleText = this.createElement("span", {
-      textContent: "API 连接测试结果",
+      textContent: getString("settings-image-summary-test-result-title"),
       styles: { fontSize: "13px", fontWeight: "600" },
     });
     // 按钮容器
@@ -429,7 +435,7 @@ export class ImageSummarySettingsPage {
       styles: { display: "flex", gap: "8px" },
     });
     const copyBtn = this.createElement("button", {
-      textContent: "复制详情",
+      textContent: getString("settings-image-summary-copy-details"),
       styles: {
         border: "1px solid #ddd",
         background: "#fff",
@@ -455,8 +461,14 @@ export class ImageSummarySettingsPage {
         } else {
           throw new Error("clipboard api unavailable");
         }
-        new ztoolkit.ProgressWindow("一图总结", { closeTime: 1500 })
-          .createLine({ text: "已复制错误详情", type: "success" })
+        new ztoolkit.ProgressWindow(
+          getString("settings-image-summary-progress-title"),
+          { closeTime: 1500 },
+        )
+          .createLine({
+            text: getString("settings-image-summary-error-details-copied"),
+            type: "success",
+          })
           .show();
       } catch {
         try {
@@ -469,13 +481,22 @@ export class ImageSummarySettingsPage {
           (tmp as any).select?.();
           (doc as any).execCommand?.("copy");
           (tmp as any).remove?.();
-          new ztoolkit.ProgressWindow("一图总结", { closeTime: 1500 })
-            .createLine({ text: "已复制错误详情", type: "success" })
+          new ztoolkit.ProgressWindow(
+            getString("settings-image-summary-progress-title"),
+            { closeTime: 1500 },
+          )
+            .createLine({
+              text: getString("settings-image-summary-error-details-copied"),
+              type: "success",
+            })
             .show();
         } catch {
-          new ztoolkit.ProgressWindow("一图总结", { closeTime: 2500 })
+          new ztoolkit.ProgressWindow(
+            getString("settings-image-summary-progress-title"),
+            { closeTime: 2500 },
+          )
             .createLine({
-              text: "复制失败，可手动选择文本复制",
+              text: getString("settings-image-summary-copy-failed"),
               type: "default",
             })
             .show();
@@ -507,6 +528,536 @@ export class ImageSummarySettingsPage {
     this.container.appendChild(form);
   }
 
+  private createPageTitle(titleText: string): HTMLElement {
+    const title = this.createElement("h2", {
+      textContent: titleText,
+      styles: {
+        color: "#59c0bc",
+        marginBottom: "20px",
+        fontSize: "20px",
+        borderBottom: "2px solid #59c0bc",
+        paddingBottom: "10px",
+      },
+    });
+    return title;
+  }
+
+  private createSettingsCard(
+    titleText: string,
+    subtitleText: string,
+  ): { card: HTMLElement; body: HTMLElement } {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    const card = doc.createElement("section");
+    Object.assign(card.style, {
+      padding: "18px",
+      borderRadius: "14px",
+      background: "var(--ai-surface, #ffffff)",
+      border: "1px solid var(--ai-border, #d7dde5)",
+      boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    });
+
+    const header = doc.createElement("div");
+    Object.assign(header.style, {
+      display: "flex",
+      flexDirection: "column",
+      gap: "6px",
+      marginBottom: "16px",
+      paddingBottom: "12px",
+      borderBottom: "1px solid var(--ai-border, #e5e7eb)",
+    });
+
+    const title = doc.createElement("div");
+    title.textContent = titleText;
+    Object.assign(title.style, {
+      fontSize: "16px",
+      fontWeight: "750",
+      color: "var(--ai-text, #1f2937)",
+    });
+    header.appendChild(title);
+
+    const subtitle = doc.createElement("div");
+    subtitle.textContent = subtitleText;
+    Object.assign(subtitle.style, {
+      fontSize: "12px",
+      lineHeight: "1.6",
+      color: "var(--ai-text-muted, #6b7280)",
+    });
+    header.appendChild(subtitle);
+    card.appendChild(header);
+
+    const body = doc.createElement("div");
+    Object.assign(body.style, {
+      display: "grid",
+      gridTemplateColumns: "minmax(0, 1fr)",
+      gap: "2px",
+    });
+    card.appendChild(body);
+
+    return { card, body };
+  }
+
+  private createPresetPanel(): HTMLElement {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    const panel = doc.createElement("section");
+    Object.assign(panel.style, {
+      padding: "16px",
+      borderRadius: "14px",
+      border: "1px solid rgba(156, 39, 176, 0.22)",
+      background:
+        "linear-gradient(135deg, rgba(156,39,176,0.08), rgba(255,255,255,0)), var(--ai-surface, #ffffff)",
+      boxShadow: "0 8px 24px rgba(15, 23, 42, 0.05)",
+    });
+
+    const header = doc.createElement("div");
+    Object.assign(header.style, {
+      display: "flex",
+      alignItems: "flex-start",
+      justifyContent: "space-between",
+      gap: "16px",
+      marginBottom: "12px",
+    });
+
+    const copy = doc.createElement("div");
+    const title = doc.createElement("div");
+    title.textContent = getString("settings-image-summary-quick-start");
+    Object.assign(title.style, {
+      fontSize: "15px",
+      fontWeight: "750",
+      color: "var(--ai-text, #1f2937)",
+      marginBottom: "4px",
+    });
+    copy.appendChild(title);
+
+    const desc = doc.createElement("div");
+    desc.textContent = getString(
+      "settings-image-summary-quick-start-description",
+    );
+    Object.assign(desc.style, {
+      fontSize: "12px",
+      lineHeight: "1.6",
+      color: "var(--ai-text-muted, #6b7280)",
+    });
+    copy.appendChild(desc);
+    header.appendChild(copy);
+
+    const badge = doc.createElement("span");
+    badge.textContent = getString(
+      "settings-image-summary-recommended-first-setup",
+    );
+    Object.assign(badge.style, {
+      flex: "0 0 auto",
+      padding: "5px 9px",
+      borderRadius: "999px",
+      fontSize: "11px",
+      fontWeight: "700",
+      color: "#7b1fa2",
+      background: "rgba(156, 39, 176, 0.10)",
+      border: "1px solid rgba(156, 39, 176, 0.16)",
+    });
+    header.appendChild(badge);
+    panel.appendChild(header);
+
+    const presetSelect = createSelect(
+      "imageSummaryPreset",
+      [
+        {
+          value: "",
+          label: getString("settings-image-summary-preset-placeholder"),
+        },
+        {
+          value: "gemini",
+          label: getString("settings-image-summary-preset-gemini"),
+        },
+        {
+          value: "openai",
+          label: getString("settings-image-summary-preset-openai"),
+        },
+        {
+          value: "agnes21",
+          label: getString("settings-image-summary-preset-agnes"),
+        },
+        {
+          value: "dashscope",
+          label: getString("settings-image-summary-preset-dashscope"),
+        },
+      ],
+      "",
+      (newVal) => this.applyImageProviderPreset(newVal),
+    );
+    panel.appendChild(presetSelect);
+
+    const note = doc.createElement("div");
+    note.textContent = getString("settings-image-summary-preset-note");
+    Object.assign(note.style, {
+      marginTop: "8px",
+      fontSize: "11px",
+      lineHeight: "1.5",
+      color: "var(--ai-text-muted, #6b7280)",
+    });
+    panel.appendChild(note);
+
+    return panel;
+  }
+
+  private createResolutionSetting(): HTMLElement {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    const wrapper = doc.createElement("div");
+    Object.assign(wrapper.style, {
+      display: "flex",
+      flexDirection: "column",
+      gap: "8px",
+    });
+
+    const current =
+      ((getPref("imageSummaryResolution" as any) as string) || "1K").trim() ||
+      "1K";
+    const presets = ["1K", "2K", "4K"];
+    const isPreset = presets.includes(current);
+
+    const select = createSelect(
+      "imageSummaryResolutionPreset",
+      [
+        {
+          value: "1K",
+          label: getString("settings-image-summary-resolution-1k"),
+        },
+        {
+          value: "2K",
+          label: getString("settings-image-summary-resolution-2k"),
+        },
+        {
+          value: "4K",
+          label: getString("settings-image-summary-resolution-4k"),
+        },
+        {
+          value: "custom",
+          label: getString("settings-image-summary-resolution-custom"),
+        },
+      ],
+      isPreset ? current : "custom",
+      (value) => this.updateResolutionCustomInputVisibility(value),
+    );
+    wrapper.appendChild(select);
+
+    const customInput = createInput(
+      "imageSummaryResolutionCustom",
+      "text",
+      isPreset ? "" : current,
+      getString("settings-image-summary-resolution-custom-placeholder"),
+    );
+    customInput.style.display = isPreset ? "none" : "block";
+    wrapper.appendChild(customInput);
+
+    return wrapper;
+  }
+
+  private updateResolutionCustomInputVisibility(value?: string): void {
+    const preset =
+      value ||
+      ((
+        this.container.querySelector(
+          "#setting-imageSummaryResolutionPreset",
+        ) as any
+      )?.getValue?.() as string | undefined) ||
+      "1K";
+    const customInput = this.container.querySelector(
+      "#setting-imageSummaryResolutionCustom",
+    ) as HTMLInputElement | null;
+    if (customInput) {
+      customInput.style.display = preset === "custom" ? "block" : "none";
+    }
+  }
+
+  private getResolutionSettingValue(): string {
+    const presetEl = this.container.querySelector(
+      "#setting-imageSummaryResolutionPreset",
+    ) as HTMLElement | null;
+    const preset =
+      (presetEl as any)?.getValue?.() ||
+      presetEl?.getAttribute("data-value") ||
+      "1K";
+    if (preset !== "custom") return String(preset || "1K").trim() || "1K";
+
+    const customInput = this.container.querySelector(
+      "#setting-imageSummaryResolutionCustom",
+    ) as HTMLInputElement | null;
+    return (customInput?.value || "").trim() || "1K";
+  }
+
+  private showPresetConfirmDialog(
+    presetName: string,
+    onConfirm: () => void,
+  ): void {
+    const doc = this.container.ownerDocument || Zotero.getMainWindow().document;
+    this.container
+      .querySelectorAll(".ai-butler-image-preset-dialog")
+      .forEach((node: Element) => node.remove());
+
+    const overlay = doc.createElement("div");
+    overlay.className = "ai-butler-image-preset-dialog";
+    Object.assign(overlay.style, {
+      position: "fixed",
+      inset: "0",
+      minHeight: "100vh",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: "24px",
+      background: "rgba(15, 23, 42, 0.36)",
+      zIndex: "99999",
+      boxSizing: "border-box",
+      overflow: "auto",
+    });
+
+    const dialog = doc.createElement("div");
+    Object.assign(dialog.style, {
+      width: "min(560px, calc(100vw - 48px))",
+      maxHeight: "calc(100vh - 48px)",
+      overflow: "auto",
+      padding: "18px",
+      borderRadius: "12px",
+      background: "var(--ai-surface, #ffffff)",
+      border: "1px solid var(--ai-border, #d7dde5)",
+      boxShadow: "0 18px 50px rgba(15, 23, 42, 0.2)",
+      color: "var(--ai-text, #1f2937)",
+      boxSizing: "border-box",
+    });
+    overlay.appendChild(dialog);
+
+    const title = doc.createElement("div");
+    title.textContent = getString("settings-image-summary-apply-preset-title");
+    Object.assign(title.style, {
+      fontSize: "16px",
+      fontWeight: "700",
+      marginBottom: "12px",
+      color: "var(--ai-text, #1f2937)",
+    });
+    dialog.appendChild(title);
+
+    const message = doc.createElement("div");
+    message.innerHTML = getString(
+      "settings-image-summary-apply-preset-message",
+      {
+        args: { preset: this.escapeHtml(presetName) },
+      },
+    );
+    Object.assign(message.style, {
+      fontSize: "13px",
+      lineHeight: "1.65",
+      color: "var(--ai-text-muted, #4b5563)",
+      wordBreak: "break-word",
+    });
+    dialog.appendChild(message);
+
+    const actions = doc.createElement("div");
+    Object.assign(actions.style, {
+      display: "flex",
+      justifyContent: "flex-end",
+      gap: "10px",
+      marginTop: "18px",
+      flexWrap: "wrap",
+    });
+
+    const close = () => {
+      overlay.remove();
+      this.setSelectValue("imageSummaryPreset", "");
+    };
+
+    const cancelButton = createStyledButton(
+      getString("settings-image-summary-cancel"),
+      "#9e9e9e",
+      "small",
+    );
+    cancelButton.addEventListener("click", close);
+    actions.appendChild(cancelButton);
+
+    const confirmButton = createStyledButton(
+      getString("settings-image-summary-confirm-apply"),
+      "#9c27b0",
+      "small",
+    );
+    confirmButton.addEventListener("click", () => {
+      overlay.remove();
+      onConfirm();
+    });
+    actions.appendChild(confirmButton);
+    dialog.appendChild(actions);
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) close();
+    });
+    dialog.addEventListener("click", (event) => event.stopPropagation());
+
+    (doc.body || this.container).appendChild(overlay);
+  }
+
+  private escapeHtml(value: string): string {
+    return value.replace(/[&<>"']/g, (char) => {
+      switch (char) {
+        case "&":
+          return "&amp;";
+        case "<":
+          return "&lt;";
+        case ">":
+          return "&gt;";
+        case '"':
+          return "&quot;";
+        case "'":
+          return "&#39;";
+        default:
+          return char;
+      }
+    });
+  }
+
+  private applyImageProviderPreset(preset: string): void {
+    if (!preset) return;
+
+    const presetNames: Record<string, string> = {
+      gemini: getString("settings-image-summary-preset-gemini"),
+      openai: getString("settings-image-summary-preset-openai"),
+      agnes21: "Agnes Image 2.1 Flash",
+      dashscope: getString("settings-image-summary-preset-dashscope"),
+    };
+    const presetName = presetNames[preset] || preset;
+
+    this.showPresetConfirmDialog(presetName, () =>
+      this.applyImageProviderPresetConfirmed(preset, presetName),
+    );
+  }
+
+  private applyImageProviderPresetConfirmed(
+    preset: string,
+    presetName: string,
+  ): void {
+    const timeoutSeconds = String(
+      ImageClient.getImageSummaryRequestTimeoutSeconds(),
+    );
+
+    const configs: Record<
+      string,
+      {
+        requestMode: "gemini" | "openai";
+        apiUrl: string;
+        model: string;
+        aspectRatioEnabled: boolean;
+        aspectRatio: string;
+        resolutionEnabled: boolean;
+        resolution: string;
+        customHeaders?: string;
+      }
+    > = {
+      gemini: {
+        requestMode: "gemini",
+        apiUrl: "https://generativelanguage.googleapis.com",
+        model: "gemini-3-pro-image-preview",
+        aspectRatioEnabled: true,
+        aspectRatio: "16:9",
+        resolutionEnabled: true,
+        resolution: "1K",
+      },
+      openai: {
+        requestMode: "openai",
+        apiUrl: "https://api.openai.com/v1/images/generations",
+        model: "gpt-image-1",
+        aspectRatioEnabled: true,
+        aspectRatio: "16:9",
+        resolutionEnabled: true,
+        resolution: "1K",
+      },
+      agnes21: {
+        requestMode: "openai",
+        apiUrl: "https://apihub.agnes-ai.com/v1/images/generations",
+        model: "agnes-image-2.1-flash",
+        aspectRatioEnabled: true,
+        aspectRatio: "16:9",
+        resolutionEnabled: true,
+        resolution: "2K",
+      },
+      dashscope: {
+        requestMode: "openai",
+        apiUrl:
+          "https://dashscope.aliyuncs.com/compatible-mode/v1/images/generations",
+        model: "qwen-image-2.0",
+        aspectRatioEnabled: false,
+        aspectRatio: "16:9",
+        resolutionEnabled: false,
+        resolution: "1K",
+      },
+    };
+
+    const config = configs[preset];
+    if (!config) {
+      this.setSelectValue("imageSummaryPreset", "");
+      return;
+    }
+
+    // 应用预设是一次显式重置：直接写入 prefs 后重新渲染，确保页面和持久化配置同步。
+    setPref("imageSummaryRequestMode" as any, config.requestMode);
+    setPref("imageSummaryApiKey" as any, "");
+    setPref("imageSummaryApiUrl" as any, config.apiUrl);
+    setPref("imageSummaryModel" as any, config.model);
+    setPref("imageSummaryCustomHeaders" as any, config.customHeaders || "");
+    setPref("imageSummaryRequestTimeoutSeconds" as any, timeoutSeconds);
+    setPref(
+      "imageSummaryLanguage" as any,
+      getString("settings-image-summary-default-language"),
+    );
+    setPref("imageSummaryAspectRatioEnabled" as any, config.aspectRatioEnabled);
+    setPref("imageSummaryAspectRatio" as any, config.aspectRatio);
+    setPref("imageSummaryResolutionEnabled" as any, config.resolutionEnabled);
+    setPref("imageSummaryResolution" as any, config.resolution);
+    setPref("imageSummaryUseExistingNote" as any, false);
+    setPref("autoImageSummaryOnComplete" as any, false);
+
+    this.render();
+
+    new ztoolkit.ProgressWindow(
+      getString("settings-image-summary-progress-title"),
+      {
+        closeOnClick: true,
+        closeTime: 2500,
+      },
+    )
+      .createLine({
+        text: getString("settings-image-summary-preset-applied", {
+          args: { preset: presetName },
+        }),
+        type: "success",
+      })
+      .show();
+  }
+
+  private setInputValue(id: string, value: string): void {
+    const input = this.container.querySelector("#setting-" + id) as
+      HTMLInputElement | HTMLTextAreaElement | null;
+    if (!input) return;
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  private setCheckboxValue(id: string, checked: boolean): void {
+    const input = this.container.querySelector(
+      "#setting-" + id,
+    ) as HTMLInputElement | null;
+    if (!input) return;
+    input.checked = checked;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  private setSelectValue(id: string, value: string): void {
+    const el = this.container.querySelector("#setting-" + id) as any;
+    if (!el) return;
+    if (typeof el.setValue === "function") el.setValue(value);
+    else if ("value" in el) el.value = value;
+    el.setAttribute?.("data-value", value);
+    el.dispatchEvent?.(new Event("change", { bubbles: true }));
+    if (id === "imageSummaryResolutionPreset") {
+      this.updateResolutionCustomInputVisibility(value);
+    }
+  }
+
   /**
    * 保存设置
    */
@@ -526,8 +1077,7 @@ export class ImageSummarySettingsPage {
 
       for (const field of fields) {
         const input = this.container.querySelector(`#setting-${field}`) as
-          | HTMLInputElement
-          | HTMLTextAreaElement;
+          HTMLInputElement | HTMLTextAreaElement;
         if (input) {
           setPref(field as any, input.value.trim() as any);
         }
@@ -559,17 +1109,8 @@ export class ImageSummarySettingsPage {
         setPref("imageSummaryRequestMode" as any, modeValue);
       }
 
-      // 下拉框单独处理 (resolution)
-      const resolutionSelect = this.container.querySelector(
-        "#setting-imageSummaryResolution",
-      ) as HTMLElement;
-      if (resolutionSelect) {
-        const resValue =
-          (resolutionSelect as any).getValue?.() ||
-          resolutionSelect.getAttribute("data-value") ||
-          "1K";
-        setPref("imageSummaryResolution" as any, resValue);
-      }
+      const resolutionValue = this.getResolutionSettingValue();
+      setPref("imageSummaryResolution" as any, resolutionValue);
 
       // 复选框单独处理
       const useExistingCb = this.container.querySelector(
@@ -613,7 +1154,10 @@ export class ImageSummarySettingsPage {
         closeOnClick: true,
         closeTime: 2000,
       })
-        .createLine({ text: "一图总结设置已保存", type: "success" })
+        .createLine({
+          text: getString("settings-image-summary-settings-saved"),
+          type: "success",
+        })
         .show();
     } catch (error: any) {
       ztoolkit.log("[AI-Butler] 保存一图总结设置失败:", error);
@@ -621,7 +1165,12 @@ export class ImageSummarySettingsPage {
         closeOnClick: true,
         closeTime: 3000,
       })
-        .createLine({ text: `保存失败: ${error.message}`, type: "error" })
+        .createLine({
+          text: getString("settings-image-summary-save-failed", {
+            args: { message: error.message },
+          }),
+          type: "error",
+        })
         .show();
     }
   }
@@ -684,7 +1233,9 @@ export class ImageSummarySettingsPage {
         resultBox.style.backgroundColor = "#ffebee";
         resultBox.style.border = "1px solid #ffcdd2";
         resultPre.style.color = "#b71c1c";
-        resultPre.textContent = "❌ 请先填写 API Key";
+        resultPre.textContent = getString(
+          "settings-image-summary-api-key-required",
+        );
       }
       return;
     }
@@ -695,7 +1246,7 @@ export class ImageSummarySettingsPage {
       resultBox.style.backgroundColor = "#fff8e1";
       resultBox.style.border = "1px solid #ffe082";
       resultPre.style.color = "#5d4037";
-      resultPre.textContent = "正在测试连接…\n请稍候。";
+      resultPre.textContent = getString("settings-image-summary-testing-wait");
     }
 
     try {
@@ -716,7 +1267,15 @@ export class ImageSummarySettingsPage {
         resultBox.style.backgroundColor = "#e8f5e9";
         resultBox.style.border = "1px solid #a5d6a7";
         resultPre.style.color = "#1b5e20";
-        resultPre.textContent = `✅ API 连接成功，生成了 ${result.mimeType} 图片 (${Math.round(result.imageBase64.length / 1024)} KB)`;
+        resultPre.textContent = getString(
+          "settings-image-summary-test-success",
+          {
+            args: {
+              mimeType: result.mimeType,
+              size: Math.round(result.imageBase64.length / 1024),
+            },
+          },
+        );
       }
     } catch (error: any) {
       ztoolkit.log("[AI-Butler] 一图总结 API 测试失败:", error);
@@ -724,7 +1283,13 @@ export class ImageSummarySettingsPage {
       const fullMsg =
         error instanceof ImageGenerationError
           ? ImageClient.formatError(error)
-          : `错误信息: ${error?.message || "连接失败"}`;
+          : getString("settings-image-summary-error-message", {
+              args: {
+                message:
+                  error?.message ||
+                  getString("settings-image-summary-connection-failed"),
+              },
+            });
 
       if (resultBox && resultPre) {
         resultBox.style.display = "block";
@@ -741,12 +1306,7 @@ export class ImageSummarySettingsPage {
    * @returns 用户是否确认开启
    */
   private showCostWarningDialog(): boolean {
-    const message =
-      "⚠️ 费用警告\n\n" +
-      "开启『自动添加一图总结』功能后，每当论文AI总结完成时，" +
-      "系统将自动调用生图 API 生成学术概念海报。\n\n" +
-      "这将消耗大量 API 调用次数和费用！\n\n" +
-      "确定要开启此功能吗？";
+    const message = getString("settings-image-summary-cost-warning");
 
     return ztoolkit.getGlobal("confirm")(message);
   }
@@ -773,7 +1333,10 @@ export class ImageSummarySettingsPage {
       closeOnClick: true,
       closeTime: 2000,
     })
-      .createLine({ text: "提示词已重置为默认值", type: "success" })
+      .createLine({
+        text: getString("settings-image-summary-prompts-reset"),
+        type: "success",
+      })
       .show();
   }
 
@@ -827,7 +1390,11 @@ export class ImageSummarySettingsPage {
       color: "var(--ai-text)",
     });
 
-    const official = this.createEndpointMeta("官方 Endpoint：");
+    const official = this.createEndpointMeta(
+      getString("settings-image-summary-official-endpoint", {
+        args: { endpoint: "" },
+      }),
+    );
     official.style.marginLeft = "auto";
     labelRow.appendChild(labelEl);
     labelRow.appendChild(official);
@@ -847,10 +1414,12 @@ export class ImageSummarySettingsPage {
     });
 
     const required = doc.createElement("span");
-    required.textContent = "【必填】";
+    required.textContent = getString("settings-image-summary-required");
     required.style.flex = "0 0 auto";
 
-    const preview = this.createEndpointMeta("预览：");
+    const preview = this.createEndpointMeta(
+      getString("settings-image-summary-preview", { args: { endpoint: "" } }),
+    );
     preview.style.maxWidth = "440px";
 
     desc.appendChild(required);
@@ -860,9 +1429,16 @@ export class ImageSummarySettingsPage {
     const update = () => {
       const endpoint = this.buildImageEndpointPreview(id, placeholder);
       const officialEndpoint = this.getImageOfficialEndpoint();
-      official.textContent = `官方 Endpoint：${officialEndpoint}`;
+      official.textContent = getString(
+        "settings-image-summary-official-endpoint",
+        {
+          args: { endpoint: officialEndpoint },
+        },
+      );
       official.title = officialEndpoint;
-      preview.textContent = `预览：${endpoint}`;
+      preview.textContent = getString("settings-image-summary-preview", {
+        args: { endpoint },
+      });
       preview.title = endpoint;
     };
 
@@ -936,6 +1512,18 @@ export class ImageSummarySettingsPage {
 
   private getImageOfficialEndpoint(): string {
     if (this.getImageRequestMode() === "openai") {
+      const model =
+        (
+          this.container.querySelector(
+            "#setting-imageSummaryModel",
+          ) as HTMLInputElement | null
+        )?.value?.trim() || "";
+      if (/^agnes-image(?:$|[-_.:])/i.test(model)) {
+        return "https://apihub.agnes-ai.com/v1/images/generations";
+      }
+      if (/^qwen-image(?:$|[-_.:])/i.test(model)) {
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1/images/generations";
+      }
       return "https://api.openai.com/v1/images/generations";
     }
     return "https://generativelanguage.googleapis.com";
@@ -984,7 +1572,7 @@ export class ImageSummarySettingsPage {
 
     const toggleBtn = doc.createElement("button");
     toggleBtn.textContent = "👁";
-    toggleBtn.title = "显示/隐藏密钥";
+    toggleBtn.title = getString("settings-image-summary-toggle-key");
     toggleBtn.type = "button";
     toggleBtn.style.cssText = `
       border: 1px solid #ddd;

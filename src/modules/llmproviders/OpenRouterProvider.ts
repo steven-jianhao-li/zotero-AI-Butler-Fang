@@ -10,7 +10,8 @@ import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { getRequestTimeoutMs } from "./shared/llmutils";
 import {
   getConnectionTestInput,
-  getConnectionTestModeLabel,
+  formatConnectionTestSuccess,
+  formatProviderTimeout,
 } from "./shared/connectionTest";
 import {
   deriveVersionedModelsUrl,
@@ -23,6 +24,19 @@ import {
   normalizeAbortError,
   throwIfAborted,
 } from "./shared/requestAbort";
+import { recordFinishReason } from "./shared/truncation";
+import {
+  providerHttpRequestFailed,
+  providerMissingApiKey,
+  providerMissingApiUrl,
+  providerNoPdfFiles,
+  providerNoPdfProcessed,
+  providerRequestFailed,
+  providerStreamMissingDone,
+  providerStreamParseFailed,
+  providerStreamTruncated,
+  providerStreamUnexpectedEnd,
+} from "./shared/localizedErrors";
 import { resolveOpenRouterReasoningEffort } from "./shared/reasoning";
 
 /**
@@ -53,8 +67,8 @@ export class OpenRouterProvider implements ILlmProvider {
     ).trim();
     const apiUrl = this.normalizeChatCompletionsUrl(rawApiUrl);
     const apiKey = (options.apiKey || "").trim();
-    if (!apiUrl) throw new Error("API URL 未配置");
-    if (!apiKey) throw new Error("API Key 未配置");
+    if (!apiUrl) throw new Error(providerMissingApiUrl());
+    if (!apiKey) throw new Error(providerMissingApiKey());
     return { apiUrl, apiKey };
   }
 
@@ -292,7 +306,7 @@ export class OpenRouterProvider implements ILlmProvider {
       const status = error?.xmlhttp?.status;
       const responseBody =
         error?.xmlhttp?.response || error?.xmlhttp?.responseText || "";
-      let errorMessage = error?.message || "OpenRouter Request Failed";
+      let errorMessage = error?.message || providerRequestFailed("OpenRouter");
       let errorName = "NetworkError";
 
       try {
@@ -331,13 +345,20 @@ export class OpenRouterProvider implements ILlmProvider {
       const json =
         typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
       const content = json?.choices?.[0]?.message?.content || "";
-      return `Mode: ${getConnectionTestModeLabel(testInput.mode)}\n✅ Connection Successful!\nModel: ${model}\nResponse: ${content}\n\n--- Raw Response ---\n${typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse, null, 2)}`;
+      return formatConnectionTestSuccess({
+        mode: testInput.mode,
+        model,
+        response: content,
+        rawResponse,
+      });
     }
 
     const { APITestError } = await import("./types");
     throw new APITestError(`HTTP ${status}`, {
       errorName: `HTTP_${status}`,
-      errorMessage: `HTTP ${status}: ${response.statusText || "Request failed"}`,
+      errorMessage: response.statusText
+        ? `HTTP ${status}: ${response.statusText}`
+        : providerHttpRequestFailed(status),
       statusCode: status,
       requestUrl: apiUrl,
       requestBody: payloadStr,
@@ -403,11 +424,11 @@ export class OpenRouterProvider implements ILlmProvider {
                 const parsed = errorResponse ? JSON.parse(errorResponse) : null;
                 const err = parsed?.error || parsed || {};
                 const code = err?.code || `HTTP ${status}`;
-                const msg = err?.message || "Request failed";
+                const msg = err?.message || providerHttpRequestFailed(status);
                 abortError = new Error(`${code}: ${msg}`);
                 xmlhttp.abort();
               } catch {
-                abortError = new Error(`HTTP ${status}: Request failed`);
+                abortError = new Error(providerHttpRequestFailed(status));
                 xmlhttp.abort();
               }
               return;
@@ -433,6 +454,12 @@ export class OpenRouterProvider implements ILlmProvider {
 
                   try {
                     const evt = JSON.parse(jsonStr);
+                    recordFinishReason(
+                      options,
+                      "openrouter",
+                      "choices.finish_reason",
+                      evt?.choices?.[0]?.finish_reason,
+                    );
                     const delta = evt?.choices?.[0]?.delta?.content;
                     if (typeof delta === "string" && delta.length > 0) {
                       gotAnyDelta = true;
@@ -465,7 +492,9 @@ export class OpenRouterProvider implements ILlmProvider {
           xmlhttp.ontimeout = () => {
             if (!abortError)
               abortError = new Error(
-                `Timeout: exceeded ${options.requestTimeoutMs ?? getRequestTimeoutMs()} ms`,
+                formatProviderTimeout(
+                  options.requestTimeoutMs ?? getRequestTimeoutMs(),
+                ),
               );
           };
         },
@@ -481,10 +510,11 @@ export class OpenRouterProvider implements ILlmProvider {
       if (isAbortError(error, options.abortSignal)) {
         throw normalizeAbortError(error, options.abortSignal);
       }
-      const errorMessage = error?.message || "OpenRouter request failed";
+      const errorMessage =
+        error?.message || providerRequestFailed("OpenRouter");
       // ... Error parsing ...
       if (gotAnyDelta && chunks.length > 0) return chunks.join("");
-      throw new Error(errorMessage);
+      throw new Error(errorMessage, { cause: error });
     } finally {
       cleanupAbortSignal?.();
     }
@@ -520,6 +550,12 @@ export class OpenRouterProvider implements ILlmProvider {
       });
       throwIfAborted(options.abortSignal);
       const data = res.response || res;
+      recordFinishReason(
+        options,
+        "openrouter",
+        "choices.finish_reason",
+        data?.choices?.[0]?.finish_reason,
+      );
       const text = data?.choices?.[0]?.message?.content || "";
       const result = typeof text === "string" ? text : JSON.stringify(text);
       if (onProgress && result) await onProgress(result);
@@ -529,8 +565,8 @@ export class OpenRouterProvider implements ILlmProvider {
         throw normalizeAbortError(abortError || e, options.abortSignal);
       }
       // ... Error handling ...
-      const msg = e?.message || "OpenRouter request failed";
-      throw new Error(msg);
+      const msg = e?.message || providerRequestFailed("OpenRouter");
+      throw new Error(msg, { cause: e });
     } finally {
       cleanupAbortSignal?.();
     }
@@ -553,7 +589,7 @@ export class OpenRouterProvider implements ILlmProvider {
     const { apiUrl, apiKey } = this.ensureUrlAndKey(options);
     const model = (options.model || "google/gemma-3-27b-it").trim();
 
-    if (pdfFiles.length === 0) throw new Error("没有要处理的 PDF 文件");
+    if (pdfFiles.length === 0) throw new Error(providerNoPdfFiles());
 
     // 构建 file 部分
     const fileParts: any[] = [];
@@ -578,7 +614,7 @@ export class OpenRouterProvider implements ILlmProvider {
     }
 
     if (fileParts.length === 0) {
-      throw new Error("没有成功处理任何 PDF 文件");
+      throw new Error(providerNoPdfProcessed());
     }
 
     ztoolkit.log(

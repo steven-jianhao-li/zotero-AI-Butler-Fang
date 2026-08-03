@@ -20,7 +20,9 @@
  * @author AI-Butler Team
  */
 
+import { getString } from "../utils/locale";
 import { getPref } from "../utils/prefs";
+import type { TaskProgressMeta } from "./taskQueue";
 
 type PDFTextExtractionStep = {
   step: string;
@@ -55,7 +57,7 @@ export class PDFTextExtractionError extends Error {
   public readonly diagnosticText: string;
 
   constructor(message: string, diagnostics: PDFTextExtractionDiagnostics) {
-    super(`PDF text extraction failed: ${message}`);
+    super(getString("pdf-error-text-extraction-failed", { args: { message } }));
     this.name = "PDFTextExtractionError";
     this.diagnostics = diagnostics;
     this.diagnosticText = PDFExtractor.formatDiagnostics(diagnostics);
@@ -68,9 +70,150 @@ export class PDFTextExtractionError extends Error {
  * 提供静态方法集合,用于 PDF 文本的提取、清理和处理
  * 采用静态方法设计,简化调用方式,无需实例化
  */
+export type PdfExtractionProgressCallback = (
+  message: string,
+  progress: number,
+  meta?: TaskProgressMeta,
+) => void;
+
 export class PDFExtractor {
+  public static isPdfAttachment(attachment: Zotero.Item): boolean {
+    const contentType = String(
+      (attachment as any).attachmentContentType ||
+        (attachment as any).attachmentMIMEType ||
+        "",
+    ).toLowerCase();
+    if (contentType === "application/pdf") return true;
+
+    const filePath = String((attachment as any).getFilePath?.() || "");
+    return filePath.toLowerCase().endsWith(".pdf");
+  }
+
   private static readonly TEXT_EXTRACTION_TIMEOUT_MS = 30000;
   private static readonly TEXT_EXTRACTION_POLL_INTERVAL_MS = 1000;
+  private static readonly pdfDownloadLocks = new Map<
+    number,
+    Promise<string | false>
+  >();
+
+  /**
+   * 确保 Zotero stored PDF 附件已经存在于本地。
+   *
+   * Zotero 文件同步可能只同步了附件元数据，PDF 二进制文件尚未下载。
+   * 此方法在用户启用自动下载时调用 Zotero 的按需下载接口，并在下载后
+   * 重新读取本地路径，供文本提取、Base64 上传和多 PDF 流程复用。
+   */
+  public static async ensurePdfAttachmentAvailable(
+    pdfAttachment: Zotero.Item,
+    options?: {
+      progressCallback?: PdfExtractionProgressCallback;
+      progressBase?: number;
+      progressTarget?: number;
+    },
+  ): Promise<string | false> {
+    const existingPath = await pdfAttachment.getFilePathAsync();
+    if (existingPath && (await this.pathExists(existingPath))) {
+      return existingPath;
+    }
+
+    const autoDownloadMissingPdf =
+      ((getPref("autoDownloadMissingPdf" as any) as boolean | undefined) ??
+        true) === true;
+    if (!autoDownloadMissingPdf) {
+      return false;
+    }
+
+    if (!(pdfAttachment as any).isStoredFileAttachment?.()) {
+      ztoolkit.log(
+        `[PDFExtractor] PDF attachment is missing locally but is not stored in Zotero storage: ${pdfAttachment.id}`,
+      );
+      return false;
+    }
+
+    const existingLock = this.pdfDownloadLocks.get(pdfAttachment.id);
+    if (existingLock) {
+      return existingLock;
+    }
+
+    const downloadPromise = this.downloadMissingPdfAttachment(
+      pdfAttachment,
+      options,
+    ).finally(() => {
+      this.pdfDownloadLocks.delete(pdfAttachment.id);
+    });
+    this.pdfDownloadLocks.set(pdfAttachment.id, downloadPromise);
+    return downloadPromise;
+  }
+
+  private static async downloadMissingPdfAttachment(
+    pdfAttachment: Zotero.Item,
+    options?: {
+      progressCallback?: PdfExtractionProgressCallback;
+      progressBase?: number;
+      progressTarget?: number;
+    },
+  ): Promise<string | false> {
+    const syncRunner = (Zotero as any).Sync?.Runner;
+    if (typeof syncRunner?.downloadFile !== "function") {
+      ztoolkit.log(
+        "[PDFExtractor] Zotero.Sync.Runner.downloadFile is unavailable",
+      );
+      return false;
+    }
+
+    const title = String(pdfAttachment.getField("title") || "PDF");
+    options?.progressCallback?.(
+      getString("progress-pdf-downloading-message"),
+      options.progressBase ?? 15,
+      {
+        stage: "pdf-extracting",
+        label: getString("progress-pdf-downloading"),
+        detail: getString("progress-pdf-downloading-detail", {
+          args: { title },
+        }),
+      },
+    );
+
+    try {
+      ztoolkit.log(
+        `[PDFExtractor] Downloading missing Zotero PDF attachment: ${pdfAttachment.id}`,
+      );
+      await syncRunner.downloadFile(pdfAttachment);
+    } catch (error) {
+      ztoolkit.log("[PDFExtractor] Zotero PDF download failed:", error);
+      return false;
+    }
+
+    const downloadedPath = await pdfAttachment.getFilePathAsync();
+    if (downloadedPath && (await this.pathExists(downloadedPath))) {
+      options?.progressCallback?.(
+        getString("progress-pdf-downloaded-message"),
+        options.progressTarget ?? 20,
+        {
+          stage: "pdf-extracting",
+          label: getString("progress-pdf-downloaded"),
+          detail: getString("progress-pdf-downloaded-detail", {
+            args: { title },
+          }),
+        },
+      );
+      return downloadedPath;
+    }
+
+    ztoolkit.log(
+      `[PDFExtractor] Zotero PDF download finished but local file is still unavailable: ${pdfAttachment.id}`,
+    );
+    return false;
+  }
+
+  private static async pathExists(path: string): Promise<boolean> {
+    try {
+      return await IOUtils.exists(path);
+    } catch (error) {
+      ztoolkit.log(`[PDFExtractor] 检查文件路径失败: ${path}`, error);
+      return false;
+    }
+  }
 
   /**
    * 检查条目是否有可用的 PDF 附件
@@ -90,7 +233,10 @@ export class PDFExtractor {
 
       for (const attachmentID of attachments) {
         const attachment = await Zotero.Items.getAsync(attachmentID);
-        if (attachment.attachmentContentType === "application/pdf") {
+        if (
+          attachment &&
+          attachment.attachmentContentType === "application/pdf"
+        ) {
           return true;
         }
       }
@@ -123,7 +269,10 @@ export class PDFExtractor {
 
       for (const attachmentID of attachments) {
         const attachment = await Zotero.Items.getAsync(attachmentID);
-        if (attachment.attachmentContentType === "application/pdf") {
+        if (
+          attachment &&
+          attachment.attachmentContentType === "application/pdf"
+        ) {
           pdfAttachments.push(attachment);
         }
       }
@@ -160,7 +309,10 @@ export class PDFExtractor {
 
       for (const attachmentID of attachments) {
         const attachment = await Zotero.Items.getAsync(attachmentID);
-        if (attachment.attachmentContentType === "application/pdf") {
+        if (
+          attachment &&
+          attachment.attachmentContentType === "application/pdf"
+        ) {
           pdfAttachments.push(attachment);
         }
       }
@@ -225,12 +377,13 @@ export class PDFExtractor {
   public static async extractTextFromItem(
     item: Zotero.Item,
     pdfProcessMode?: string,
+    progressCallback?: PdfExtractionProgressCallback,
   ): Promise<string> {
     // 第一步:获取条目的所有附件 ID
     const attachments = item.getAttachments();
 
     if (attachments.length === 0) {
-      throw new Error("No attachments found for this item");
+      throw new Error(getString("pdf-error-no-attachments"));
     }
 
     // 策略修改: 获取所有 PDF 并按添加时间排序，取最早的一个 (通常是原文)
@@ -239,13 +392,16 @@ export class PDFExtractor {
     for (const attachmentID of attachments) {
       const attachment = await Zotero.Items.getAsync(attachmentID);
       // 检查附件的 MIME 类型是否为 PDF
-      if (attachment.attachmentContentType === "application/pdf") {
+      if (
+        attachment &&
+        attachment.attachmentContentType === "application/pdf"
+      ) {
         pdfAttachments.push(attachment);
       }
     }
 
     if (pdfAttachments.length === 0) {
-      throw new Error("No PDF attachment found for this item");
+      throw new Error(getString("pdf-error-no-pdf-attachment"));
     }
 
     // 按 dateAdded 升序排序 (最早的在前)
@@ -280,7 +436,7 @@ export class PDFExtractor {
       );
       try {
         const { MineruClient } = await import("./mineruIntegration");
-        return await MineruClient.extractMarkdown(item);
+        return await MineruClient.extractMarkdown(item, progressCallback);
       } catch (e) {
         ztoolkit.log(
           "[AI Butler] MinerU extraction failed, returning to Zotero built-in extraction",
@@ -290,13 +446,27 @@ export class PDFExtractor {
     }
 
     // 若选择 Zotero 全文索引模式或MinerU失效，则使用 Zotero 全文索引提取文本
-    const text = await this.extractTextFromPDF(pdfAttachment);
+    progressCallback?.(getString("progress-pdf-zotero-index-message"), 20, {
+      stage: "pdf-extracting",
+      label: getString("progress-pdf-extracting"),
+      detail: getString("progress-pdf-extracting-detail", {
+        args: { title: pdfAttachment.getField("title") || "PDF" },
+      }),
+    });
+    const text = await this.extractTextFromPDF(pdfAttachment, progressCallback);
 
     // 第四步:验证文本有效性
     if (!text || text.trim().length === 0) {
-      throw new Error("Failed to extract text from PDF or PDF is empty");
+      throw new Error(getString("pdf-error-text-empty"));
     }
 
+    progressCallback?.(getString("progress-pdf-text-extracted-message"), 38, {
+      stage: "pdf-extracting",
+      label: getString("progress-pdf-extracted"),
+      detail: getString("progress-pdf-extracted-detail", {
+        args: { count: text.length },
+      }),
+    });
     return text;
   }
 
@@ -323,16 +493,21 @@ export class PDFExtractor {
    */
   private static async extractTextFromPDF(
     pdfAttachment: Zotero.Item,
+    progressCallback?: PdfExtractionProgressCallback,
   ): Promise<string> {
     const startedAtMs = Date.now();
     const diagnostics = this.createTextExtractionDiagnostics(pdfAttachment);
 
     try {
-      // 获取 PDF 文件的本地路径
-      const path = await pdfAttachment.getFilePathAsync();
+      // 获取 PDF 文件的本地路径；必要时先从 Zotero 云端按需下载
+      const path = await this.ensurePdfAttachmentAvailable(pdfAttachment, {
+        progressCallback,
+        progressBase: 12,
+        progressTarget: 18,
+      });
       diagnostics.filePath = path || undefined;
       if (!path) {
-        throw new Error("PDF file path not found");
+        throw new Error(getString("pdf-error-file-path-not-found"));
       }
 
       await this.recordPdfFileInfo(path, diagnostics, startedAtMs);
@@ -478,7 +653,9 @@ export class PDFExtractor {
       diagnostics.steps.push({
         step: "pdf-file",
         ok: diagnostics.fileExists,
-        message: diagnostics.fileExists ? "PDF file found" : "PDF file missing",
+        message: diagnostics.fileExists
+          ? getString("pdf-diagnostic-message-file-found")
+          : getString("pdf-diagnostic-message-file-missing"),
         elapsedMs: Date.now() - startedAtMs,
       });
     } catch (error: unknown) {
@@ -504,7 +681,10 @@ export class PDFExtractor {
         step,
         ok: textLength > 0,
         textLength,
-        message: textLength > 0 ? "attachmentText returned text" : "empty text",
+        message:
+          textLength > 0
+            ? getString("pdf-diagnostic-message-attachment-text-returned")
+            : getString("pdf-diagnostic-message-empty-text"),
         elapsedMs: Date.now() - startedAtMs,
       });
       return textLength > 0 ? text : "";
@@ -558,7 +738,9 @@ export class PDFExtractor {
         cacheExists,
         cacheSize,
         textLength,
-        message: cacheExists ? "cache checked" : "cache missing",
+        message: cacheExists
+          ? getString("pdf-diagnostic-message-cache-checked")
+          : getString("pdf-diagnostic-message-cache-missing"),
         elapsedMs: Date.now() - startedAtMs,
       });
 
@@ -610,7 +792,7 @@ export class PDFExtractor {
       diagnostics.steps.push({
         step: "indexItems",
         ok: true,
-        message: "index requested",
+        message: getString("pdf-diagnostic-message-index-requested"),
         elapsedMs: Date.now() - startedAtMs,
       });
     } catch (error: unknown) {
@@ -652,37 +834,91 @@ export class PDFExtractor {
   public static formatDiagnostics(
     diagnostics: PDFTextExtractionDiagnostics,
   ): string {
+    const unknown = getString("pdf-diagnostic-unknown");
+    const value = (input: unknown) => String(input ?? unknown);
     const lines = [
-      "PDF text extraction diagnostics",
-      `startedAt: ${diagnostics.startedAt}`,
-      `durationMs: ${diagnostics.durationMs ?? "unknown"}`,
-      `zoteroVersion: ${diagnostics.zoteroVersion || "unknown"}`,
-      `platform: ${diagnostics.platform || "unknown"}`,
-      `userAgent: ${diagnostics.userAgent || "unknown"}`,
-      `itemId: ${diagnostics.itemId}`,
-      `itemKey: ${diagnostics.itemKey || "unknown"}`,
-      `title: ${diagnostics.title || "unknown"}`,
-      `contentType: ${diagnostics.contentType || "unknown"}`,
-      `filePath: ${diagnostics.filePath || "unknown"}`,
-      `fileExists: ${diagnostics.fileExists ?? "unknown"}`,
-      `fileSize: ${diagnostics.fileSize ?? "unknown"}`,
-      "steps:",
+      getString("pdf-diagnostic-title"),
+      getString("pdf-diagnostic-started-at", {
+        args: { value: value(diagnostics.startedAt) },
+      }),
+      getString("pdf-diagnostic-duration-ms", {
+        args: { value: value(diagnostics.durationMs) },
+      }),
+      getString("pdf-diagnostic-zotero-version", {
+        args: { value: value(diagnostics.zoteroVersion) },
+      }),
+      getString("pdf-diagnostic-platform", {
+        args: { value: value(diagnostics.platform) },
+      }),
+      getString("pdf-diagnostic-user-agent", {
+        args: { value: value(diagnostics.userAgent) },
+      }),
+      getString("pdf-diagnostic-item-id", {
+        args: { value: value(diagnostics.itemId) },
+      }),
+      getString("pdf-diagnostic-item-key", {
+        args: { value: value(diagnostics.itemKey) },
+      }),
+      getString("pdf-diagnostic-note-title", {
+        args: { value: value(diagnostics.title) },
+      }),
+      getString("pdf-diagnostic-content-type", {
+        args: { value: value(diagnostics.contentType) },
+      }),
+      getString("pdf-diagnostic-file-path", {
+        args: { value: value(diagnostics.filePath) },
+      }),
+      getString("pdf-diagnostic-file-exists", {
+        args: { value: value(diagnostics.fileExists) },
+      }),
+      getString("pdf-diagnostic-file-size", {
+        args: { value: value(diagnostics.fileSize) },
+      }),
+      getString("pdf-diagnostic-steps"),
     ];
 
     diagnostics.steps.forEach((step, index) => {
       lines.push(
         [
-          `  ${index + 1}. ${step.step}`,
-          `ok=${step.ok ?? "unknown"}`,
-          `elapsedMs=${step.elapsedMs ?? "unknown"}`,
-          step.indexedState ? `indexedState=${step.indexedState}` : "",
-          step.textLength !== undefined ? `textLength=${step.textLength}` : "",
-          step.cachePath ? `cachePath=${step.cachePath}` : "",
-          step.cacheExists !== undefined
-            ? `cacheExists=${step.cacheExists}`
+          getString("pdf-diagnostic-step-prefix", {
+            args: { index: index + 1, step: step.step },
+          }),
+          getString("pdf-diagnostic-step-ok", {
+            args: { value: value(step.ok) },
+          }),
+          getString("pdf-diagnostic-step-elapsed-ms", {
+            args: { value: value(step.elapsedMs) },
+          }),
+          step.indexedState
+            ? getString("pdf-diagnostic-step-indexed-state", {
+                args: { value: value(step.indexedState) },
+              })
             : "",
-          step.cacheSize !== undefined ? `cacheSize=${step.cacheSize}` : "",
-          step.message ? `message=${step.message}` : "",
+          step.textLength !== undefined
+            ? getString("pdf-diagnostic-step-text-length", {
+                args: { value: value(step.textLength) },
+              })
+            : "",
+          step.cachePath
+            ? getString("pdf-diagnostic-step-cache-path", {
+                args: { value: value(step.cachePath) },
+              })
+            : "",
+          step.cacheExists !== undefined
+            ? getString("pdf-diagnostic-step-cache-exists", {
+                args: { value: value(step.cacheExists) },
+              })
+            : "",
+          step.cacheSize !== undefined
+            ? getString("pdf-diagnostic-step-cache-size", {
+                args: { value: value(step.cacheSize) },
+              })
+            : "",
+          step.message
+            ? getString("pdf-diagnostic-step-message", {
+                args: { value: value(step.message) },
+              })
+            : "",
         ]
           .filter(Boolean)
           .join(" | "),
@@ -702,12 +938,12 @@ export class PDFExtractor {
     pdfAttachment: Zotero.Item,
   ): Promise<string> {
     if (pdfAttachment.attachmentContentType !== "application/pdf") {
-      throw new Error("Attachment is not a PDF");
+      throw new Error(getString("pdf-error-attachment-not-pdf"));
     }
 
     const text = await this.extractTextFromPDF(pdfAttachment);
     if (!text || text.trim().length === 0) {
-      throw new Error("Failed to extract text from PDF or PDF is empty");
+      throw new Error(getString("pdf-error-text-empty"));
     }
     return text;
   }
@@ -834,12 +1070,18 @@ export class PDFExtractor {
    */
   public static async extractBase64FromItem(
     item: Zotero.Item,
+    progressCallback?: PdfExtractionProgressCallback,
   ): Promise<string> {
     // 第一步: 获取条目的所有附件 ID
+    progressCallback?.(getString("progress-pdf-preparing-base64-message"), 12, {
+      stage: "pdf-extracting",
+      label: getString("progress-pdf-preparing"),
+      detail: getString("progress-pdf-preparing-base64-detail"),
+    });
     const attachments = item.getAttachments();
 
     if (attachments.length === 0) {
-      throw new Error("No attachments found for this item");
+      throw new Error(getString("pdf-error-no-attachments"));
     }
 
     // 策略修改: 获取所有 PDF 并按添加时间排序，取最早的一个
@@ -847,13 +1089,16 @@ export class PDFExtractor {
 
     for (const attachmentID of attachments) {
       const attachment = await Zotero.Items.getAsync(attachmentID);
-      if (attachment.attachmentContentType === "application/pdf") {
+      if (
+        attachment &&
+        attachment.attachmentContentType === "application/pdf"
+      ) {
         pdfAttachments.push(attachment);
       }
     }
 
     if (pdfAttachments.length === 0) {
-      throw new Error("No PDF attachment found for this item");
+      throw new Error(getString("pdf-error-no-pdf-attachment"));
     }
 
     // 按 dateAdded 升序排序
@@ -867,10 +1112,14 @@ export class PDFExtractor {
       `[AI Butler] Selected oldest PDF (Base64): ${pdfAttachment.getField("title")} (Added: ${pdfAttachment.dateAdded})`,
     );
 
-    // 第三步: 获取 PDF 文件路径
-    const pdfPath = await pdfAttachment.getFilePathAsync();
+    // 第三步: 获取 PDF 文件路径；必要时先从 Zotero 云端按需下载
+    const pdfPath = await this.ensurePdfAttachmentAvailable(pdfAttachment, {
+      progressCallback,
+      progressBase: 18,
+      progressTarget: 25,
+    });
     if (!pdfPath) {
-      throw new Error("Failed to get PDF file path");
+      throw new Error(getString("pdf-error-get-file-path-failed"));
     }
 
     // 第四步: 读取 PDF 文件内容
@@ -879,7 +1128,7 @@ export class PDFExtractor {
       const pdfData = await Zotero.File.getBinaryContentsAsync(pdfPath);
 
       if (!pdfData || pdfData.length === 0) {
-        throw new Error("PDF file is empty or cannot be read");
+        throw new Error(getString("pdf-error-file-empty-or-unreadable"));
       }
 
       // 第五步: 转换为 Base64 编码
@@ -897,9 +1146,21 @@ export class PDFExtractor {
       }
       const base64String = btoa(binary);
 
+      progressCallback?.(getString("progress-pdf-base64-ready-message"), 35, {
+        stage: "pdf-extracting",
+        label: getString("progress-pdf-prepared"),
+        detail: getString("progress-pdf-base64-detail", {
+          args: { length: base64String.length },
+        }),
+      });
       return base64String;
     } catch (error: any) {
-      throw new Error(`Failed to read or encode PDF: ${error.message}`);
+      throw new Error(
+        getString("pdf-error-read-or-encode-failed", {
+          args: { message: error.message },
+        }),
+        { cause: error },
+      );
     }
   }
 
@@ -910,18 +1171,18 @@ export class PDFExtractor {
     pdfAttachment: Zotero.Item,
   ): Promise<string> {
     if (pdfAttachment.attachmentContentType !== "application/pdf") {
-      throw new Error("Attachment is not a PDF");
+      throw new Error(getString("pdf-error-attachment-not-pdf"));
     }
 
-    const pdfPath = await pdfAttachment.getFilePathAsync();
+    const pdfPath = await this.ensurePdfAttachmentAvailable(pdfAttachment);
     if (!pdfPath) {
-      throw new Error("Failed to get PDF file path");
+      throw new Error(getString("pdf-error-get-file-path-failed"));
     }
 
     try {
       const pdfData = await Zotero.File.getBinaryContentsAsync(pdfPath);
       if (!pdfData || pdfData.length === 0) {
-        throw new Error("PDF file is empty or cannot be read");
+        throw new Error(getString("pdf-error-file-empty-or-unreadable"));
       }
 
       const bytes = new Uint8Array(pdfData.length);
@@ -937,7 +1198,10 @@ export class PDFExtractor {
       return btoa(binary);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to read or encode PDF: ${message}`);
+      throw new Error(
+        getString("pdf-error-read-or-encode-failed", { args: { message } }),
+        { cause: error },
+      );
     }
   }
 }
