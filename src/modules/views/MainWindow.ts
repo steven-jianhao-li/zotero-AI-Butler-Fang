@@ -28,8 +28,10 @@
  */
 
 import { config } from "../../../package.json";
+import { prepareDocument } from "../../compatibility/document";
 import { DashboardView } from "./DashboardView";
 import { SummaryView } from "./SummaryView";
+import { AgentView } from "./agent/AgentView";
 import { TaskQueueView } from "./TaskQueueView";
 import { SettingsView } from "./SettingsView";
 import { LibraryScannerView } from "./LibraryScannerView";
@@ -50,6 +52,7 @@ import {
 export type TabType =
   | "dashboard"
   | "summary"
+  | "agent"
   | "tasks"
   | "settings"
   | "scanner"
@@ -101,6 +104,23 @@ export class MainWindow {
   /** 当前激活的标签页 */
   private activeTab: TabType = "dashboard";
 
+  private navigationListeners = new Set<() => void>();
+
+  public onNavigationChange(listener: () => void): () => void {
+    this.navigationListeners.add(listener);
+    return () => this.navigationListeners.delete(listener);
+  }
+
+  private notifyNavigationChange(): void {
+    for (const listener of Array.from(this.navigationListeners)) {
+      try {
+        listener();
+      } catch (error) {
+        ztoolkit.log("[AI Butler] Navigation subscriber failed:", error);
+      }
+    }
+  }
+
   /** 视图容器 */
   private viewContainer: HTMLElement | null = null;
 
@@ -118,6 +138,8 @@ export class MainWindow {
 
   /** AI 总结视图 */
   private summaryView: SummaryView;
+
+  private agentView: AgentView;
 
   /** 任务队列视图 */
   private taskQueueView: TaskQueueView;
@@ -138,6 +160,7 @@ export class MainWindow {
     // 初始化各个视图
     this.dashboardView = new DashboardView();
     this.summaryView = new SummaryView();
+    this.agentView = new AgentView();
     this.taskQueueView = new TaskQueueView();
     this.settingsView = new SettingsView();
     this.libraryScannerView = new LibraryScannerView();
@@ -152,6 +175,7 @@ export class MainWindow {
     // 注册视图
     this.views.set("dashboard", this.dashboardView);
     this.views.set("summary", this.summaryView);
+    this.views.set("agent", this.agentView);
     this.views.set("tasks", this.taskQueueView);
     this.views.set("settings", this.settingsView);
     this.views.set("scanner", this.libraryScannerView);
@@ -236,6 +260,8 @@ export class MainWindow {
           height: dialogSize.height,
           centerscreen: true,
           resizable: true,
+          // Use native window controls, including title-bar maximize/restore.
+          noDialogMode: true,
         });
       this.isOpen = true;
 
@@ -298,8 +324,8 @@ export class MainWindow {
     const { width: screenWidth, height: screenHeight } =
       this.getAvailableScreenSize();
     const lowResolution = screenWidth <= 1440 || screenHeight <= 900;
-    const targetWidth = lowResolution ? 820 : 950;
-    const targetHeight = lowResolution ? 560 : 750;
+    const targetWidth = 1100;
+    const targetHeight = 800;
     const horizontalMargin = lowResolution ? 96 : 160;
     const verticalMargin = lowResolution ? 128 : 160;
     const width = this.clampDialogDimension(
@@ -410,6 +436,7 @@ export class MainWindow {
     this.dialog = null;
     this.isOpen = false;
     this.resetUIState();
+    this.notifyNavigationChange();
 
     if (this.isDialogHandleActive(dialog)) {
       try {
@@ -462,6 +489,7 @@ export class MainWindow {
     }
 
     const doc = dialog.window.document;
+    prepareDocument(doc);
     const tryInit = () => {
       if (this.dialog !== dialog || !this.isDialogHandleActive(dialog)) {
         this.uiInitializing = false;
@@ -501,6 +529,12 @@ export class MainWindow {
           label: getString("main-window-tab-summary"),
           icon: "📝",
         },
+        {
+          id: "agent",
+          label: getString("main-window-tab-agent"),
+          icon: "✦",
+          className: "agent-tab",
+        },
         { id: "tasks", label: getString("main-window-tab-tasks"), icon: "📋" },
         {
           id: "settings",
@@ -523,6 +557,7 @@ export class MainWindow {
       // 标记完成
       this.uiInitialized = true;
       this.uiInitializing = false;
+      this.notifyNavigationChange();
     };
 
     // 启动首次尝试
@@ -566,6 +601,13 @@ export class MainWindow {
       themeLink.rel = "stylesheet";
       themeLink.href = `chrome://${config.addonRef}/content/aiButlerTheme.css`;
       head.appendChild(themeLink);
+    }
+    if (!doc.getElementById("ai-butler-agent-css")) {
+      const agentLink = doc.createElement("link");
+      agentLink.id = "ai-butler-agent-css";
+      agentLink.rel = "stylesheet";
+      agentLink.href = `chrome://${config.addonRef}/content/agent.css`;
+      head.appendChild(agentLink);
     }
   }
 
@@ -624,6 +666,7 @@ export class MainWindow {
       // 视图未实现,显示占位符
       this.showPlaceholder(tabId);
     }
+    if (this.uiInitialized) this.notifyNavigationChange();
   }
 
   public openLibraryScanner(target: AiNoteKind): void {
@@ -707,6 +750,7 @@ export class MainWindow {
     this.isOpening = false;
     this.dialog = null;
     this.resetUIState();
+    this.notifyNavigationChange();
 
     ztoolkit.log("[AI Butler] 主窗口已关闭");
   }

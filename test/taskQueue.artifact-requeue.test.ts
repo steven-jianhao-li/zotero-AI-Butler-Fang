@@ -13,6 +13,7 @@ import {
   type FixedTaskArtifactType,
 } from "../src/modules/taskArtifacts";
 import { AiNoteService } from "../src/modules/aiNoteService";
+import { ContentExtractor } from "../src/modules/contentExtractor";
 
 type QueueInternals = {
   tasks: Map<string, TaskItem>;
@@ -43,6 +44,10 @@ type QueueInternals = {
     },
   ): Promise<string>;
   removeTask(taskId: string): Promise<void>;
+  clearTasksForItems(itemIds: Iterable<number>): Promise<number>;
+  clearCompleted(): Promise<void>;
+  clearAll(): Promise<void>;
+  onRemoved(callback: (taskId: string) => void): () => void;
   isAutoCreationSuppressed(
     itemId: number,
     taskType: "summary" | "deepRead",
@@ -101,12 +106,16 @@ function createTask(status: TaskStatus): TaskItem {
 describe("TaskQueue artifact-aware requeue", function () {
   const item = { id: 1, getField: () => "Paper" } as unknown as Zotero.Item;
   let originalProbe: typeof TaskArtifacts.probe;
+  let originalHasUsableAttachment: typeof ContentExtractor.hasUsableAnalyzableAttachment;
   let originalFindNote: typeof AiNoteService.findNote;
   let originalNoteStrategy: string | number | boolean | null | undefined;
   let originalTableStrategy: string | number | boolean | null | undefined;
 
   beforeEach(function () {
     originalProbe = TaskArtifacts.probe;
+    originalHasUsableAttachment =
+      ContentExtractor.hasUsableAnalyzableAttachment;
+    ContentExtractor.hasUsableAnalyzableAttachment = async () => true;
     originalFindNote = AiNoteService.findNote;
     originalNoteStrategy = Zotero.Prefs.get(noteStrategyPref, true) as
       string | number | boolean | null | undefined;
@@ -118,6 +127,8 @@ describe("TaskQueue artifact-aware requeue", function () {
 
   afterEach(function () {
     TaskArtifacts.probe = originalProbe;
+    ContentExtractor.hasUsableAnalyzableAttachment =
+      originalHasUsableAttachment;
     AiNoteService.findNote = originalFindNote;
     if (originalNoteStrategy == null) {
       Zotero.Prefs.clear(noteStrategyPref, true);
@@ -379,6 +390,44 @@ describe("TaskQueue artifact-aware requeue", function () {
     expect(getSummaryTaskId(1)).to.equal("summary-task-1");
     expect(getDeepReadTaskId(1)).to.equal("deepread-task-1");
     expect(getSummaryTaskId(1)).to.not.equal(getDeepReadTaskId(1));
+  });
+
+  it("notifies waiters after removal and unsubscribes without affecting queue cleanup", async function () {
+    const manager = createQueueInternals();
+    const seen: string[] = [];
+    const unsubscribe = manager.onRemoved((id) => {
+      expect(manager.tasks.has(id)).to.equal(false);
+      seen.push(id);
+    });
+    const entry = createTask(TaskStatus.PENDING);
+    manager.tasks.set(entry.id, entry);
+    await manager.removeTask(entry.id);
+    expect(seen).to.deep.equal([entry.id]);
+    unsubscribe();
+    manager.tasks.set(entry.id, entry);
+    await manager.removeTask(entry.id);
+    expect(seen).to.have.length(1);
+  });
+
+  it("notifies workflow waiters when clearing selected items, completed tasks or all tasks", async function () {
+    for (const operation of [
+      "clearTasksForItems",
+      "clearCompleted",
+      "clearAll",
+    ] as const) {
+      const manager = createQueueInternals();
+      const seen: string[] = [];
+      manager.onRemoved((id) => {
+        expect(manager.tasks.has(id)).to.equal(false);
+        seen.push(id);
+      });
+      const entry = createTask(TaskStatus.COMPLETED);
+      manager.tasks.set(entry.id, entry);
+      if (operation === "clearTasksForItems")
+        await manager.clearTasksForItems([entry.itemId]);
+      else await manager[operation]();
+      expect(seen).to.deep.equal([entry.id]);
+    }
   });
 
   it("treats deep-read notes with runnable slots as incomplete artifacts", async function () {

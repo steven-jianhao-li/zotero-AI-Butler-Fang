@@ -3,8 +3,10 @@
 - [🏠 首页](/)
 - [🚀 快速开始](quick-start.md)
 - [🔑 API 配置指南](api-configuration.md)
+- [✦ Agent 研究助手](agent.md)
 - [🖼️ 一图总结](one-image-summary.md)
 - [📚 文献综述](literature-review.md)
+- [📤 AI 笔记导出](note-export.md)
 - [❓ 常见问题 FAQ](faq.md)
 - [🔧 故障排除](troubleshooting.md)
 

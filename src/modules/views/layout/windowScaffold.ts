@@ -2,6 +2,7 @@ export type MainTabDescriptor<T extends string> = {
   id: T;
   label: string;
   icon: string;
+  className?: string;
 };
 
 export type SettingsNavDescriptor<T extends string> = {
@@ -88,6 +89,7 @@ export function createMainWindowScaffold<T extends string>(
 ): MainWindowScaffoldRefs<T> {
   const doc = getDocument(host);
   const compact = isCompactHost(host);
+  const navHeight = compact ? "48px" : "52px";
   applyHostFrame(host);
   host.innerHTML = "";
 
@@ -95,12 +97,15 @@ export function createMainWindowScaffold<T extends string>(
     id: "ai-butler-window-scaffold",
     styles: {
       position: "fixed",
-      inset: "0",
+      top: "0",
+      right: "0",
+      bottom: "0",
+      left: "0",
       width: "100vw",
       height: "100vh",
       minHeight: "0",
       display: "grid",
-      gridTemplateRows: "auto minmax(0, 1fr)",
+      gridTemplateRows: `${navHeight} minmax(0, 1fr)`,
       overflow: "hidden",
       backgroundColor: "var(--ai-bg)",
       boxSizing: "border-box",
@@ -111,14 +116,21 @@ export function createMainWindowScaffold<T extends string>(
 
   const topNav = createElement(doc, "div", {
     id: "tab-bar",
+    className: "ai-butler-main-tabs",
     styles: {
       display: "flex",
-      minHeight: "0",
+      alignItems: "center",
+      height: navHeight,
+      minHeight: navHeight,
+      minWidth: "0",
+      padding: compact ? "6px 8px" : "8px 12px",
+      gap: "6px",
+      boxSizing: "border-box",
+      overflow: "hidden",
       backgroundColor: "var(--ai-surface)",
       borderBottom: compact
         ? "1px solid var(--ai-border)"
         : "2px solid var(--ai-border)",
-      boxShadow: "0 1px 0 rgba(0, 0, 0, 0.04)",
       zIndex: "20",
     },
   });
@@ -138,28 +150,50 @@ export function createMainWindowScaffold<T extends string>(
   for (const tab of tabs) {
     const button = createElement(doc, "button", {
       id: `tab-${tab.id}`,
-      className: "tab-button",
+      className: `tab-button ${tab.className || ""}`.trim(),
       styles: {
-        flex: "1",
+        appearance: "none",
+        flex: "1 1 0",
         minWidth: "0",
-        padding: compact ? "8px 14px" : "12px 20px",
+        minHeight: "34px",
+        height: "34px",
+        maxHeight: "34px",
+        margin: "0",
+        padding: "0 8px",
         border: "none",
-        borderBottom: "3px solid transparent",
+        borderRadius: "7px",
+        boxShadow: "none",
         backgroundColor: "transparent",
         color: "var(--ai-text-muted)",
-        fontSize: compact ? "13px" : "14px",
+        fontFamily: "inherit",
+        fontSize: "13px",
+        lineHeight: "20px",
         fontWeight: "600",
         cursor: "pointer",
-        transition: "all 0.2s",
+        transition: "background-color 0.15s, color 0.15s",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         gap: compact ? "4px" : "6px",
         boxSizing: "border-box",
         whiteSpace: "nowrap",
+        overflow: "hidden",
       },
     });
-    button.innerHTML = `${tab.icon} ${tab.label}`;
+    button.type = "button";
+    button.title = tab.label;
+    const icon = createElement(doc, "span", {
+      className: "main-tab-icon",
+      textContent: tab.icon,
+    });
+    icon.setAttribute("aria-hidden", "true");
+    button.append(
+      icon,
+      createElement(doc, "span", {
+        className: "main-tab-label",
+        textContent: tab.label,
+      }),
+    );
     button.addEventListener("click", () => onTabClick(tab.id));
     button.addEventListener("mouseenter", () => {
       if (!button.classList.contains("active")) {
@@ -185,21 +219,19 @@ export function createMainWindowScaffold<T extends string>(
       tabButtons.forEach((button, id) => {
         const active = id === tabId;
         button.classList.toggle("active", active);
+        button.setAttribute("aria-current", active ? "page" : "false");
         button.style.color = active
           ? "var(--ai-accent)"
           : "var(--ai-text-muted)";
         button.style.backgroundColor = active
           ? "var(--ai-accent-tint)"
           : "transparent";
-        button.style.borderBottomColor = active
-          ? "var(--ai-accent)"
-          : "transparent";
       });
     },
     setMainNavVisible(visible) {
       topNav.style.display = visible ? "flex" : "none";
       root.style.gridTemplateRows = visible
-        ? "auto minmax(0, 1fr)"
+        ? `${navHeight} minmax(0, 1fr)`
         : "minmax(0, 1fr)";
     },
   };
@@ -219,7 +251,10 @@ export function createSettingsScaffold<T extends string>(
     id: "ai-butler-settings-scaffold",
     styles: {
       position: "absolute",
-      inset: "0",
+      top: "0",
+      right: "0",
+      bottom: "0",
+      left: "0",
       display: "grid",
       gridTemplateColumns: "220px minmax(0, 1fr)",
       minHeight: "0",
@@ -235,7 +270,7 @@ export function createSettingsScaffold<T extends string>(
     styles: {
       minHeight: "0",
       minWidth: "0",
-      overflow: "hidden",
+      overflow: "auto",
       padding: compact ? "12px 0" : "18px 0",
       borderRight: "1px solid var(--ai-border)",
       backgroundColor: "var(--ai-surface-2)",
@@ -251,7 +286,7 @@ export function createSettingsScaffold<T extends string>(
       minHeight: "0",
       minWidth: "0",
       overflowY: "auto",
-      overflowX: "hidden",
+      overflowX: "auto",
       padding: compact ? "18px 22px 28px" : "24px 28px 36px",
       backgroundColor: "var(--ai-surface)",
       boxSizing: "border-box",
@@ -306,6 +341,7 @@ export function createSettingsScaffold<T extends string>(
     (event: WheelEvent) => {
       if (
         !event.deltaY ||
+        canScrollInDirection(settingsSidebar, event.deltaY) ||
         !canScrollInDirection(settingsContent, event.deltaY)
       ) {
         return;

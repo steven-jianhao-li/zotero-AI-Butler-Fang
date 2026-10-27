@@ -68,6 +68,8 @@ export class TaskQueueView extends BaseView {
   /** 定时刷新(兜底) */
   private refreshTimerId: number | null = null;
 
+  private syncScheduled = false;
+
   /** 统计信息容器 */
   private statsContainer: HTMLElement | null = null;
 
@@ -977,24 +979,7 @@ export class TaskQueueView extends BaseView {
       }
 
       if (!this.manager) this.manager = TaskQueueManager.getInstance();
-      const markedComplete =
-        await this.manager.markTaskCompletedIfArtifactReady(
-          task.id,
-          getString("task-queue-artifact-complete-fixed"),
-        );
-      if (markedComplete) {
-        this.syncFromManager();
-        await view.showSavedNoteForItem(task.itemId);
-        return;
-      }
-
-      // 注册一次性流式订阅，仅监听该 taskId
-      // 确保执行器已启动，尽快进入处理
-      try {
-        this.manager.start();
-      } catch (e) {
-        ztoolkit.log("[AI Butler] 启动任务执行器失败:", e);
-      }
+      // 查看详情只订阅事件，不启动队列或根据旧笔记修改任务状态。
       let started = false;
       this.detailStreamUnsubscribe = this.manager.onStream((taskId, event) => {
         if (taskId !== task.id) return;
@@ -1263,36 +1248,43 @@ export class TaskQueueView extends BaseView {
     const clipboard = win.navigator?.clipboard;
 
     try {
-      if (clipboard?.writeText) {
-        await clipboard.writeText(text);
-      } else {
-        throw new Error("clipboard api unavailable");
-      }
+      // Privileged Zotero windows need neither Clipboard API permissions nor
+      // HTML editing commands; use the host's stable native text-copy contract.
+      Zotero.Utilities.Internal.copyTextToClipboard(text);
     } catch {
       try {
-        const host = document.body || document.documentElement;
-        if (!host) {
-          throw new Error("document host unavailable");
-        }
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        Object.assign(textarea.style, {
-          position: "fixed",
-          left: "-9999px",
-          top: "0",
-        });
-        host.appendChild(textarea);
-        textarea.select();
-        document.execCommand("copy");
-        textarea.remove();
+        if (!clipboard?.writeText) throw new Error("clipboard api unavailable");
+        await clipboard.writeText(text);
       } catch {
-        new ztoolkit.ProgressWindow("AI Butler", { closeTime: 2200 })
-          .createLine({
-            text: getString("task-queue-copy-failed"),
-            type: "fail",
-          })
-          .show();
-        return;
+        let textarea: HTMLTextAreaElement | undefined;
+        try {
+          const host = document.body || document.documentElement;
+          if (!host) throw new Error("document host unavailable");
+          textarea = document.createElementNS(
+            "http://www.w3.org/1999/xhtml",
+            "textarea",
+          ) as HTMLTextAreaElement;
+          textarea.value = text;
+          Object.assign(textarea.style, {
+            position: "fixed",
+            left: "-9999px",
+            top: "0",
+          });
+          host.appendChild(textarea);
+          textarea.select();
+          if (!document.execCommand("copy"))
+            throw new Error(getString("task-queue-copy-failed"));
+        } catch {
+          new ztoolkit.ProgressWindow("AI Butler", { closeTime: 2200 })
+            .createLine({
+              text: getString("task-queue-copy-failed"),
+              type: "fail",
+            })
+            .show();
+          return;
+        } finally {
+          textarea?.remove();
+        }
       }
     }
 
@@ -1466,21 +1458,24 @@ export class TaskQueueView extends BaseView {
       }
 
       if (artifact.exists) {
-        await this.manager.markTaskCompletedIfArtifactReady(
-          task.id,
-          getString("task-detail-deep-read-artifact-fixed"),
-        );
-        this.syncFromManager();
-        new ztoolkit.ProgressWindow("AI Butler", {
-          closeOnClick: true,
-          closeTime: 3000,
-        })
-          .createLine({
-            text: getString("task-queue-deep-read-complete-no-need"),
-            type: "success",
+        const markedComplete =
+          await this.manager.markTaskCompletedIfArtifactReady(
+            task.id,
+            getString("task-detail-deep-read-artifact-fixed"),
+          );
+        if (markedComplete || task.status === TaskStatus.COMPLETED) {
+          this.syncFromManager();
+          new ztoolkit.ProgressWindow("AI Butler", {
+            closeOnClick: true,
+            closeTime: 3000,
           })
-          .show();
-        return;
+            .createLine({
+              text: getString("task-queue-deep-read-complete-no-need"),
+              type: "success",
+            })
+            .show();
+          return;
+        }
       }
 
       await this.manager.addDeepReadTask(item, true, {
@@ -1621,7 +1616,7 @@ export class TaskQueueView extends BaseView {
       (taskId, progress, message, meta) => {
         const currentTask = this.manager?.getTask(taskId);
         if (currentTask && currentTask.status !== TaskStatus.PROCESSING) {
-          this.syncFromManager();
+          this.scheduleSyncFromManager();
           return;
         }
 
@@ -1645,33 +1640,9 @@ export class TaskQueueView extends BaseView {
       },
     );
 
-    this.unsubscribeComplete = this.manager.onComplete(
-      (taskId, success, error) => {
-        const t = this.tasks.find((t) => t.id === taskId);
-        if (t) {
-          t.status = success ? TaskStatus.COMPLETED : TaskStatus.FAILED;
-          t.error = success ? undefined : error || t.error;
-          t.completedAt = new Date();
-          t.progress = 100;
-          t.stage = success ? "completed" : "failed";
-          t.stageLabel = success
-            ? getString("task-queue-status-completed")
-            : getString("task-queue-status-failed");
-          t.workflowStage = success
-            ? getString("task-queue-status-completed")
-            : getString("task-queue-status-failed");
-          t.stageDetail = success
-            ? getString("task-queue-detail-task-completed")
-            : error || t.error;
-          t.stageUpdatedAt = new Date();
-          this.updateStats();
-          this.renderTaskList();
-        } else {
-          // 不在视图内,做一次全量同步
-          this.syncFromManager();
-        }
-      },
-    );
+    this.unsubscribeComplete = this.manager.onComplete(() => {
+      this.scheduleSyncFromManager();
+    });
 
     // 兜底定时刷新(5s)
     if (this.refreshTimerId) {
@@ -1705,6 +1676,17 @@ export class TaskQueueView extends BaseView {
     return task;
   }
 
+  /** 合并同一批入队/完成通知，避免反复重建整个任务列表。 */
+  private scheduleSyncFromManager(): void {
+    if (this.syncScheduled) return;
+    this.syncScheduled = true;
+    void Promise.resolve().then(() => {
+      if (!this.syncScheduled) return;
+      this.syncScheduled = false;
+      this.syncFromManager();
+    });
+  }
+
   /** 从管理器同步任务到视图 */
   private syncFromManager(): void {
     if (!this.manager) return;
@@ -1718,6 +1700,7 @@ export class TaskQueueView extends BaseView {
 
   /** 视图销毁时清理回调和计时器 */
   protected onDestroy(): void {
+    this.syncScheduled = false;
     if (this.refreshTimerId) {
       clearInterval(this.refreshTimerId);
       this.refreshTimerId = null;

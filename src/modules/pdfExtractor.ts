@@ -22,7 +22,14 @@
 
 import { getString } from "../utils/locale";
 import { getPref } from "../utils/prefs";
+import { isCustomMineruServer } from "./mineruConfig";
 import type { TaskProgressMeta } from "./taskQueue";
+import type { LLMAbortSignal } from "./llmproviders/types";
+import {
+  isAbortError,
+  normalizeAbortError,
+  throwIfAborted,
+} from "./llmproviders/shared/requestAbort";
 
 type PDFTextExtractionStep = {
   step: string;
@@ -53,6 +60,7 @@ export type PDFTextExtractionDiagnostics = {
 };
 
 export class PDFTextExtractionError extends Error {
+  public readonly suppressTaskRetry = true;
   public readonly diagnostics: PDFTextExtractionDiagnostics;
   public readonly diagnosticText: string;
 
@@ -61,6 +69,39 @@ export class PDFTextExtractionError extends Error {
     this.name = "PDFTextExtractionError";
     this.diagnostics = diagnostics;
     this.diagnosticText = PDFExtractor.formatDiagnostics(diagnostics);
+  }
+
+  public static find(error: unknown): PDFTextExtractionError | undefined {
+    const pending: unknown[] = [error];
+    const visited = new Set<object>();
+    // Older request layers keep the original error under different cause fields.
+    while (pending.length && visited.size < 32) {
+      const candidate = pending.shift();
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        visited.has(candidate)
+      ) {
+        continue;
+      }
+      visited.add(candidate);
+      const nested = candidate as {
+        name?: string;
+        diagnosticText?: string;
+        cause?: unknown;
+        lastError?: unknown;
+        originalError?: unknown;
+      };
+      if (
+        candidate instanceof PDFTextExtractionError ||
+        (nested.name === "PDFTextExtractionError" &&
+          typeof nested.diagnosticText === "string")
+      ) {
+        return candidate as PDFTextExtractionError;
+      }
+      pending.push(nested.cause, nested.lastError, nested.originalError);
+    }
+    return undefined;
   }
 }
 
@@ -89,8 +130,6 @@ export class PDFExtractor {
     return filePath.toLowerCase().endsWith(".pdf");
   }
 
-  private static readonly TEXT_EXTRACTION_TIMEOUT_MS = 30000;
-  private static readonly TEXT_EXTRACTION_POLL_INTERVAL_MS = 1000;
   private static readonly pdfDownloadLocks = new Map<
     number,
     Promise<string | false>
@@ -378,7 +417,9 @@ export class PDFExtractor {
     item: Zotero.Item,
     pdfProcessMode?: string,
     progressCallback?: PdfExtractionProgressCallback,
+    options: { persist?: boolean; abortSignal?: LLMAbortSignal } = {},
   ): Promise<string> {
+    throwIfAborted(options.abortSignal);
     // 第一步:获取条目的所有附件 ID
     const attachments = item.getAttachments();
 
@@ -425,19 +466,31 @@ export class PDFExtractor {
       .trim()
       .toLowerCase();
     const mineruApiKey = (getPref("mineruApiKey") as string) || "";
-    // 若选择 MinerU API 模式且已配置 API Key，则使用 MinerU API 提取文本
+    const customMineruServer = isCustomMineruServer();
+    // 自建服务可匿名访问；官方服务仍要求 API Key。
     if (
       currentPdfMode === "mineru" &&
-      mineruApiKey &&
-      mineruApiKey.trim().length > 0
+      (customMineruServer || mineruApiKey.trim().length > 0)
     ) {
       ztoolkit.log(
-        "[AI Butler] MinerU pdf process mode selected and API Key detected, routing to MineruClient for extraction...",
+        "[AI Butler] MinerU pdf process mode selected, routing to MineruClient for extraction...",
       );
       try {
         const { MineruClient } = await import("./mineruIntegration");
-        return await MineruClient.extractMarkdown(item, progressCallback);
+        throwIfAborted(options.abortSignal);
+        return await MineruClient.extractMarkdown(
+          item,
+          progressCallback,
+          options,
+        );
       } catch (e) {
+        if (isAbortError(e, options.abortSignal)) {
+          throw normalizeAbortError(e, options.abortSignal);
+        }
+        if (customMineruServer) {
+          // Surface custom-server errors so a configured service is not bypassed.
+          throw e;
+        }
         ztoolkit.log(
           "[AI Butler] MinerU extraction failed, returning to Zotero built-in extraction",
           e,
@@ -446,6 +499,7 @@ export class PDFExtractor {
     }
 
     // 若选择 Zotero 全文索引模式或MinerU失效，则使用 Zotero 全文索引提取文本
+    throwIfAborted(options.abortSignal);
     progressCallback?.(getString("progress-pdf-zotero-index-message"), 20, {
       stage: "pdf-extracting",
       label: getString("progress-pdf-extracting"),
@@ -453,7 +507,12 @@ export class PDFExtractor {
         args: { title: pdfAttachment.getField("title") || "PDF" },
       }),
     });
-    const text = await this.extractTextFromPDF(pdfAttachment, progressCallback);
+    const text = await this.extractTextFromPDF(
+      pdfAttachment,
+      progressCallback,
+      options.abortSignal,
+    );
+    throwIfAborted(options.abortSignal);
 
     // 第四步:验证文本有效性
     if (!text || text.trim().length === 0) {
@@ -494,7 +553,9 @@ export class PDFExtractor {
   private static async extractTextFromPDF(
     pdfAttachment: Zotero.Item,
     progressCallback?: PdfExtractionProgressCallback,
+    abortSignal?: LLMAbortSignal,
   ): Promise<string> {
+    throwIfAborted(abortSignal);
     const startedAtMs = Date.now();
     const diagnostics = this.createTextExtractionDiagnostics(pdfAttachment);
 
@@ -506,6 +567,7 @@ export class PDFExtractor {
         progressTarget: 18,
       });
       diagnostics.filePath = path || undefined;
+      throwIfAborted(abortSignal);
       if (!path) {
         throw new Error(getString("pdf-error-file-path-not-found"));
       }
@@ -518,6 +580,7 @@ export class PDFExtractor {
         startedAtMs,
         "attachmentText:initial",
       );
+      throwIfAborted(abortSignal);
       if (attachmentText) {
         return attachmentText;
       }
@@ -528,64 +591,101 @@ export class PDFExtractor {
         startedAtMs,
         "fulltext-cache:initial",
       );
+      throwIfAborted(abortSignal);
       if (cachedText) {
         return cachedText;
       }
 
       // 检查全文索引状态
-      const indexedState = await this.tryGetIndexedState(
+      await this.tryGetIndexedState(
         pdfAttachment,
         diagnostics,
         startedAtMs,
         "indexed-state:before-index",
       );
 
-      // 如果未索引,触发索引操作
-      if (indexedState !== Zotero.Fulltext.INDEX_STATE_INDEXED) {
-        await this.tryIndexPdf(pdfAttachment, diagnostics, startedAtMs);
+      // Index statistics can outlive an empty cache. Repair once based on text,
+      // not INDEX_STATE_INDEXED; indexItems awaits conversion on both host lines.
+      throwIfAborted(abortSignal);
+      await this.tryIndexPdf(pdfAttachment, diagnostics, startedAtMs);
+      throwIfAborted(abortSignal);
+
+      const repairedCache = await this.tryReadFulltextCache(
+        pdfAttachment,
+        diagnostics,
+        startedAtMs,
+        "fulltext-cache:after-index",
+      );
+      throwIfAborted(abortSignal);
+      if (repairedCache) return repairedCache;
+
+      const repairedText = await this.tryReadAttachmentText(
+        pdfAttachment,
+        diagnostics,
+        startedAtMs,
+        "attachmentText:after-index",
+      );
+      throwIfAborted(abortSignal);
+      if (repairedText) return repairedText;
+
+      const converterFailed = diagnostics.steps.some(
+        (step) =>
+          step.ok === false &&
+          step.textLength === undefined &&
+          (step.step.startsWith("attachmentText:") ||
+            step.step === "indexItems"),
+      );
+      if (
+        converterFailed &&
+        Zotero.isWin &&
+        String(Zotero.version).startsWith("6.") &&
+        typeof Zotero.Fulltext.getPDFConverterExecAndArgs === "function"
+      ) {
+        const stagedText = await this.extractLegacyPdfFromAsciiWorkspace(
+          path,
+          diagnostics,
+          startedAtMs,
+          abortSignal,
+        );
+        throwIfAborted(abortSignal);
+        if (stagedText) return stagedText;
       }
 
-      const deadline = Date.now() + this.TEXT_EXTRACTION_TIMEOUT_MS;
-      let pollCount = 0;
-      while (Date.now() < deadline) {
-        pollCount++;
-        await Zotero.Promise.delay(this.TEXT_EXTRACTION_POLL_INTERVAL_MS);
-
-        const polledAttachmentText = await this.tryReadAttachmentText(
-          pdfAttachment,
-          diagnostics,
-          startedAtMs,
-          `attachmentText:poll-${pollCount}`,
-        );
-        if (polledAttachmentText) {
-          return polledAttachmentText;
-        }
-
-        const polledCacheText = await this.tryReadFulltextCache(
-          pdfAttachment,
-          diagnostics,
-          startedAtMs,
-          `fulltext-cache:poll-${pollCount}`,
-        );
-        if (polledCacheText) {
-          return polledCacheText;
-        }
-
-        await this.tryGetIndexedState(
-          pdfAttachment,
-          diagnostics,
-          startedAtMs,
-          `indexed-state:poll-${pollCount}`,
-        );
-      }
-
-      // 所有尝试都失败
+      await this.tryGetIndexedState(
+        pdfAttachment,
+        diagnostics,
+        startedAtMs,
+        "indexed-state:after-index",
+      );
+      throwIfAborted(abortSignal);
+      diagnostics.steps.push({
+        step: "index-result",
+        ok: false,
+        textLength: 0,
+        message: getString("pdf-diagnostic-message-index-no-text"),
+        elapsedMs: Date.now() - startedAtMs,
+      });
+      const failedOperation = diagnostics.steps.find(
+        (step) =>
+          step.ok === false &&
+          step.textLength === undefined &&
+          (step.step.startsWith("attachmentText:") ||
+            step.step === "indexItems" ||
+            step.step === "legacy-pdf-staging"),
+      );
       throw this.createTextExtractionError(
-        "Unable to extract text from PDF",
+        failedOperation?.message
+          ? getString("pdf-error-conversion-failed", {
+              args: { message: failedOperation.message },
+            })
+          : getString("pdf-error-no-extractable-text"),
         diagnostics,
         startedAtMs,
       );
     } catch (error: any) {
+      if (isAbortError(error, abortSignal)) {
+        throw normalizeAbortError(error, abortSignal);
+      }
       if (error instanceof PDFTextExtractionError) {
         throw error;
       }
@@ -600,6 +700,140 @@ export class PDFExtractor {
         diagnostics,
         startedAtMs,
       );
+    }
+  }
+
+  private static async extractLegacyPdfFromAsciiWorkspace(
+    sourcePath: string,
+    diagnostics: PDFTextExtractionDiagnostics,
+    startedAtMs: number,
+    abortSignal?: LLMAbortSignal,
+  ): Promise<string> {
+    let directory: string | undefined;
+    let stagedPdf: string | undefined;
+    let stagedText: string | undefined;
+    try {
+      throwIfAborted(abortSignal);
+      // Zotero 6's Windows converter opens ANSI paths. Stage privately instead
+      // of renaming an attachment, mutating host APIs, or uploading its content.
+      const creationErrors: string[] = [];
+      const workspaceRoots = [
+        () => Zotero.DataDirectory.dir,
+        () => Zotero.getTempDirectory().path,
+        () => Services.dirsvc.get("TmpD", Ci.nsIFile).path,
+      ];
+      for (const workspaceRoot of workspaceRoots) {
+        let root: string;
+        try {
+          root = workspaceRoot();
+        } catch (error: unknown) {
+          if (isAbortError(error, abortSignal))
+            throw normalizeAbortError(error, abortSignal);
+          creationErrors.push(
+            error instanceof Error ? error.message : String(error),
+          );
+          continue;
+        }
+        if (!/^[\x20-\x7e]+$/.test(root)) continue;
+        const candidate = PathUtils.join(
+          root,
+          "ai-butler-pdf-" + Zotero.Utilities.randomString(16),
+        );
+        try {
+          await IOUtils.makeDirectory(candidate, {
+            createAncestors: false,
+            ignoreExisting: false,
+          });
+          // Ownership starts only after exclusive creation succeeds; a collision
+          // must never trigger cleanup of another task's files.
+          directory = candidate;
+          break;
+        } catch (error: unknown) {
+          if (isAbortError(error, abortSignal))
+            throw normalizeAbortError(error, abortSignal);
+          creationErrors.push(
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+      if (!directory) {
+        throw new Error(
+          "No writable ASCII-path workspace: " +
+            (creationErrors.join("; ") ||
+              "library, host temporary and system temporary roots contain non-ASCII characters"),
+        );
+      }
+      stagedPdf = PathUtils.join(directory, "input.pdf");
+      stagedText = PathUtils.join(directory, "output.txt");
+      throwIfAborted(abortSignal);
+      await IOUtils.copy(sourcePath, stagedPdf, { noOverwrite: true });
+      throwIfAborted(abortSignal);
+      const { exec, args } = Zotero.Fulltext.getPDFConverterExecAndArgs();
+      await Zotero.Utilities.Internal.exec(exec, [
+        ...args,
+        "-nopgbrk",
+        stagedPdf,
+        stagedText,
+      ]);
+      throwIfAborted(abortSignal);
+      const content = await Zotero.File.getContentsAsync(stagedText);
+      throwIfAborted(abortSignal);
+      const text =
+        typeof content === "string"
+          ? content
+          : content
+            ? new TextDecoder().decode(content as BufferSource)
+            : "";
+      const textLength = text.trim().length;
+      diagnostics.steps.push({
+        step: "legacy-pdf-staging",
+        ok: textLength > 0,
+        textLength,
+        message: textLength
+          ? "Recovered using an ASCII-path PDF copy"
+          : "Staged converter completed without extractable text",
+        elapsedMs: Date.now() - startedAtMs,
+      });
+      return textLength > 0 ? text : "";
+    } catch (error: unknown) {
+      if (isAbortError(error, abortSignal))
+        throw normalizeAbortError(error, abortSignal);
+      diagnostics.steps.push({
+        step: "legacy-pdf-staging",
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+        elapsedMs: Date.now() - startedAtMs,
+      });
+      return "";
+    } finally {
+      // Converter cancellation cannot kill the host process; cleanup follows
+      // its completion and must also run when copy/read/conversion fails.
+      if (directory) {
+        for (const temporaryPath of [stagedText, stagedPdf, directory]) {
+          if (!temporaryPath) continue;
+          try {
+            if (temporaryPath === directory) {
+              Zotero.File.pathToFile(directory).remove(false);
+            } else {
+              await IOUtils.remove(temporaryPath, { ignoreAbsent: true });
+            }
+          } catch (error: unknown) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            diagnostics.steps.push({
+              step: "legacy-pdf-staging-cleanup",
+              ok: false,
+              message,
+              elapsedMs: Date.now() - startedAtMs,
+            });
+            ztoolkit.log(
+              "[AI Butler] PDF staging cleanup failed",
+              temporaryPath,
+              message,
+            );
+          }
+        }
+      }
     }
   }
 
@@ -689,6 +923,7 @@ export class PDFExtractor {
       });
       return textLength > 0 ? text : "";
     } catch (error: unknown) {
+      if (isAbortError(error)) throw normalizeAbortError(error);
       diagnostics.steps.push({
         step,
         ok: false,
@@ -746,6 +981,7 @@ export class PDFExtractor {
 
       return textLength > 0 ? text : "";
     } catch (error: unknown) {
+      if (isAbortError(error)) throw normalizeAbortError(error);
       diagnostics.steps.push({
         step,
         ok: false,
@@ -772,6 +1008,7 @@ export class PDFExtractor {
       });
       return indexedState;
     } catch (error: unknown) {
+      if (isAbortError(error)) throw normalizeAbortError(error);
       diagnostics.steps.push({
         step,
         ok: false,
@@ -796,6 +1033,7 @@ export class PDFExtractor {
         elapsedMs: Date.now() - startedAtMs,
       });
     } catch (error: unknown) {
+      if (isAbortError(error)) throw normalizeAbortError(error);
       diagnostics.steps.push({
         step: "indexItems",
         ok: false,
@@ -936,12 +1174,17 @@ export class PDFExtractor {
    */
   public static async extractTextFromAttachment(
     pdfAttachment: Zotero.Item,
+    abortSignal?: LLMAbortSignal,
   ): Promise<string> {
     if (pdfAttachment.attachmentContentType !== "application/pdf") {
       throw new Error(getString("pdf-error-attachment-not-pdf"));
     }
 
-    const text = await this.extractTextFromPDF(pdfAttachment);
+    const text = await this.extractTextFromPDF(
+      pdfAttachment,
+      undefined,
+      abortSignal,
+    );
     if (!text || text.trim().length === 0) {
       throw new Error(getString("pdf-error-text-empty"));
     }
@@ -1071,7 +1314,9 @@ export class PDFExtractor {
   public static async extractBase64FromItem(
     item: Zotero.Item,
     progressCallback?: PdfExtractionProgressCallback,
+    abortSignal?: LLMAbortSignal,
   ): Promise<string> {
+    throwIfAborted(abortSignal);
     // 第一步: 获取条目的所有附件 ID
     progressCallback?.(getString("progress-pdf-preparing-base64-message"), 12, {
       stage: "pdf-extracting",
@@ -1113,11 +1358,13 @@ export class PDFExtractor {
     );
 
     // 第三步: 获取 PDF 文件路径；必要时先从 Zotero 云端按需下载
+    throwIfAborted(abortSignal);
     const pdfPath = await this.ensurePdfAttachmentAvailable(pdfAttachment, {
       progressCallback,
       progressBase: 18,
       progressTarget: 25,
     });
+    throwIfAborted(abortSignal);
     if (!pdfPath) {
       throw new Error(getString("pdf-error-get-file-path-failed"));
     }
@@ -1126,6 +1373,7 @@ export class PDFExtractor {
     try {
       // 使用 Zotero 的 File.readAsync 读取二进制文件
       const pdfData = await Zotero.File.getBinaryContentsAsync(pdfPath);
+      throwIfAborted(abortSignal);
 
       if (!pdfData || pdfData.length === 0) {
         throw new Error(getString("pdf-error-file-empty-or-unreadable"));
@@ -1155,6 +1403,9 @@ export class PDFExtractor {
       });
       return base64String;
     } catch (error: any) {
+      if (isAbortError(error, abortSignal)) {
+        throw normalizeAbortError(error, abortSignal);
+      }
       throw new Error(
         getString("pdf-error-read-or-encode-failed", {
           args: { message: error.message },

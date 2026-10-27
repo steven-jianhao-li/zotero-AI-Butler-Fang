@@ -25,6 +25,8 @@ jobs:
         run: npm install
       - name: Run Lint
         run: npm run lint:check
+      - name: Check download statistics
+        run: node --test test/downloadStats.test.mjs
 
   build:
     runs-on: ubuntu-latest
@@ -42,6 +44,18 @@ jobs:
         run: npm install
       - name: Run Build
         run: npm run build
+      - name: Check image summary queue
+        run: npm run test:image-summary
+      - name: Check PDF extraction recovery
+        run: npm run test:pdf
+      - name: Check EPUB extraction and compatibility
+        run: npm run test:epub
+      - name: Check Sidebar viewport scrolling
+        run: npm run test:sidebar
+      - name: Check Onboarding visibility
+        run: npm run test:onboarding
+      - name: Test compatibility boundaries
+        run: npm run test:compat
       - name: Upload build result
         uses: actions/upload-artifact@v4
         with:

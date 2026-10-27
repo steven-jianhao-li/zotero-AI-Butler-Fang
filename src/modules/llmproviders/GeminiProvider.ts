@@ -1,42 +1,33 @@
+import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
 import { ILlmProvider } from "./ILlmProvider";
 import {
-  ConversationMessage,
-  LLMOptions,
-  LLMModelInfo,
-  LLMProviderCapabilities,
-  ProgressCb,
-} from "./types";
-import { SYSTEM_ROLE_PROMPT, buildUserMessage } from "../../utils/prompts";
-import { getRequestTimeoutMs } from "./shared/llmutils";
-import {
-  getConnectionTestInput,
   formatConnectionTestSuccess,
-  formatProviderTimeout,
+  getConnectionTestInput,
 } from "./shared/connectionTest";
 import {
-  deriveGeminiModelsUrl,
-  parseModelListResponse,
-  requestModelListJson,
-} from "./shared/modelList";
-import {
-  bindAbortSignal,
-  isAbortError,
-  normalizeAbortError,
-  throwIfAborted,
-} from "./shared/requestAbort";
-import { recordFinishReason } from "./shared/truncation";
-import {
-  providerHttpRequestFailed,
   providerMissingApiKey,
   providerMissingApiUrl,
   providerNoPdfFiles,
   providerNoPdfProcessed,
   providerRequestFailed,
-  providerStreamMissingDone,
-  providerStreamParseFailed,
-  providerStreamTruncated,
   providerStreamUnexpectedEnd,
 } from "./shared/localizedErrors";
+import {
+  deriveGeminiModelsUrl,
+  parseModelListResponse,
+  requestModelListJson,
+} from "./shared/modelList";
+import { throwIfAborted } from "./shared/requestAbort";
+import { mergeRequestHeaders } from "./shared/requestHeaders";
+import { requestLLMText } from "./shared/textTransport";
+import type { LLMProviderResult } from "./types";
+import {
+  ConversationMessage,
+  LLMModelInfo,
+  LLMOptions,
+  LLMProviderCapabilities,
+  ProgressCb,
+} from "./types";
 
 export class GeminiProvider implements ILlmProvider {
   readonly id = "google"; // 同步现有 provider 识别：google/gemini
@@ -55,7 +46,7 @@ export class GeminiProvider implements ILlmProvider {
     prompt: string | undefined,
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<string> {
+  ): Promise<LLMProviderResult> {
     const baseUrl = (
       options.apiUrl || "https://generativelanguage.googleapis.com"
     ).replace(/\/$/, "");
@@ -107,131 +98,18 @@ export class GeminiProvider implements ILlmProvider {
       };
     }
 
-    const chunks: string[] = [];
-    let delivered = 0;
-    let processedLength = 0;
-    let partialLine = "";
-    let gotAnyDelta = false;
-    let abortError: Error | null = null;
-    let cleanupAbortSignal: (() => void) | undefined;
-
-    try {
-      await Zotero.HTTP.request("POST", endpoint, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify(payload),
-        responseType: "text",
-        timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
-        errorDelayMax: 0,
-        requestObserver: (xmlhttp: XMLHttpRequest) => {
-          cleanupAbortSignal = bindAbortSignal(
-            options.abortSignal,
-            xmlhttp,
-            (error) => {
-              abortError = error;
-            },
-          );
-          xmlhttp.onprogress = (e: any) => {
-            const status = e.target.status;
-            if (status >= 400) {
-              try {
-                const errorResponse = e.target.response;
-                const parsed = errorResponse ? JSON.parse(errorResponse) : null;
-                const err = parsed?.error || parsed || {};
-                const code = err?.code || `HTTP ${status}`;
-                const msg = err?.message || providerRequestFailed("API");
-                const errorMessage = `${code}: ${msg}`;
-                xmlhttp.abort();
-                throw new Error(errorMessage);
-              } catch {
-                xmlhttp.abort();
-                throw new Error(providerHttpRequestFailed(status));
-              }
-            }
-
-            try {
-              const resp: string = e.target.response || "";
-              if (resp.length > processedLength) {
-                const slice = partialLine + resp.slice(processedLength);
-                processedLength = resp.length;
-                const parts = slice.split(/\r?\n/);
-                partialLine =
-                  parts[parts.length - 1].indexOf("data: ") === 0 &&
-                  slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                    ? ""
-                    : parts.pop() || "";
-
-                for (const raw of parts) {
-                  if (raw.indexOf("data: ") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr) continue;
-                  try {
-                    const json = JSON.parse(jsonStr);
-                    recordFinishReason(
-                      options,
-                      "google",
-                      "candidates.finishReason",
-                      json?.candidates?.[0]?.finishReason,
-                    );
-                    const text = this.extractGeminiText(json);
-                    if (text) {
-                      gotAnyDelta = true;
-                      chunks.push(text);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) => {
-                          ztoolkit.log(
-                            "[AI-Butler] onProgress callback error:",
-                            err,
-                          );
-                        });
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-              }
-            } catch (err) {
-              ztoolkit.log("[AI-Butler] Gemini stream parse error:", err);
-            }
-          };
-        },
-      });
-    } catch (error: any) {
-      if (abortError || isAbortError(error, options.abortSignal)) {
-        throw normalizeAbortError(abortError || error, options.abortSignal);
-      }
-      let errorMessage = error?.message || providerRequestFailed("Gemini");
-      try {
-        const responseText =
-          error?.xmlhttp?.response || error?.xmlhttp?.responseText;
-        if (responseText) {
-          const parsed =
-            typeof responseText === "string"
-              ? JSON.parse(responseText)
-              : responseText;
-          const err = parsed?.error || parsed;
-          const code = err?.code || "Error";
-          const msg = err?.message || error?.message || String(error);
-          errorMessage = `${code}: ${msg}`;
-        }
-      } catch {
-        /* ignore */
-      }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
-      throw new Error(errorMessage, { cause: error });
-    } finally {
-      cleanupAbortSignal?.();
-    }
-
-    const streamed = chunks.join("");
-    if (gotAnyDelta && streamed) return streamed;
-    return "";
+    return requestLLMText({
+      protocol: "gemini",
+      provider: this.id,
+      url: endpoint,
+      headers: mergeRequestHeaders(
+        { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        options.customHeaders,
+      ),
+      payload: payload,
+      options,
+      onProgress,
+    });
   }
 
   async chat(
@@ -240,7 +118,7 @@ export class GeminiProvider implements ILlmProvider {
     conversation: ConversationMessage[],
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<string> {
+  ): Promise<LLMProviderResult> {
     const baseUrl = (
       options.apiUrl || "https://generativelanguage.googleapis.com"
     ).replace(/\/$/, "");
@@ -290,171 +168,27 @@ export class GeminiProvider implements ILlmProvider {
 
     const genCfg: any = {};
     if (options.temperature !== undefined) genCfg.temperature = temperature;
+    if (options.maxTokens !== undefined)
+      genCfg.maxOutputTokens = options.maxTokens;
+    if (options.topP !== undefined) genCfg.topP = options.topP;
     const payload: any = {
       generationConfig: genCfg,
       contents,
       systemInstruction: { parts: [{ text: SYSTEM_ROLE_PROMPT }] },
     };
 
-    const chunks: string[] = [];
-    let delivered = 0;
-    let processedLength = 0;
-    let partialLine = "";
-    let abortError: Error | null = null;
-    let gotAnyDelta = false;
-    let cleanupAbortSignal: (() => void) | undefined;
-
-    try {
-      await Zotero.HTTP.request("POST", endpoint, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify(payload),
-        responseType: "text",
-        timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
-        errorDelayMax: 0,
-        requestObserver: (xmlhttp: XMLHttpRequest) => {
-          cleanupAbortSignal = bindAbortSignal(
-            options.abortSignal,
-            xmlhttp,
-            (error) => {
-              abortError = error;
-            },
-          );
-          xmlhttp.onprogress = (e: any) => {
-            const status = e.target.status;
-            if (status >= 400) {
-              try {
-                const errorResponse = e.target.response;
-                const parsed = errorResponse ? JSON.parse(errorResponse) : null;
-                const err = parsed?.error || parsed || {};
-                const code = err?.code || `HTTP ${status}`;
-                const msg = err?.message || providerRequestFailed("API");
-                const errorMessage = `${code}: ${msg}`;
-                abortError = new Error(errorMessage);
-                ztoolkit.log("[AI-Butler] Gemini HTTP error:", {
-                  status,
-                  code,
-                  msg,
-                  response: errorResponse,
-                });
-                xmlhttp.abort();
-              } catch (parseErr) {
-                const errorMessage = providerHttpRequestFailed(status);
-                abortError = new Error(errorMessage);
-                ztoolkit.log("[AI-Butler] Gemini HTTP error:", {
-                  status,
-                  parseErr,
-                });
-                xmlhttp.abort();
-              }
-              return;
-            }
-
-            try {
-              const resp: string = e.target.response || "";
-              if (resp.length > processedLength) {
-                const slice = partialLine + resp.slice(processedLength);
-                processedLength = resp.length;
-                const parts = slice.split(/\r?\n/);
-                partialLine =
-                  parts[parts.length - 1].indexOf("data:") === 0 &&
-                  slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                    ? ""
-                    : parts.pop() || "";
-
-                for (const raw of parts) {
-                  if (raw.indexOf("data:") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr) continue;
-
-                  try {
-                    const json = JSON.parse(jsonStr);
-                    recordFinishReason(
-                      options,
-                      "google",
-                      "candidates.finishReason",
-                      json?.candidates?.[0]?.finishReason,
-                    );
-                    const text = this.extractGeminiText(json);
-                    if (text) {
-                      gotAnyDelta = true;
-                      chunks.push(text);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) => {
-                          ztoolkit.log("[AI-Butler] onProgress error:", err);
-                        });
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-              }
-            } catch (err) {
-              ztoolkit.log("[AI-Butler] Gemini stream parse error:", err);
-            }
-          };
-          xmlhttp.onerror = () => {
-            if (!abortError)
-              abortError = new Error("NetworkError: XHR onerror");
-          };
-          xmlhttp.ontimeout = () => {
-            if (!abortError)
-              abortError = new Error(
-                formatProviderTimeout(
-                  options.requestTimeoutMs ?? getRequestTimeoutMs(),
-                ),
-              );
-          };
-        },
-      });
-    } catch (error: any) {
-      if (abortError) {
-        if (isAbortError(abortError, options.abortSignal)) {
-          throw normalizeAbortError(abortError, options.abortSignal);
-        }
-        if (gotAnyDelta && chunks.length > 0) {
-          return chunks.join("");
-        }
-        throw abortError;
-      }
-      if (isAbortError(error, options.abortSignal)) {
-        throw normalizeAbortError(error, options.abortSignal);
-      }
-      let errorMessage = error?.message || providerRequestFailed("Gemini");
-      try {
-        const responseText =
-          error?.xmlhttp?.response || error?.xmlhttp?.responseText;
-        if (responseText) {
-          const parsed =
-            typeof responseText === "string"
-              ? JSON.parse(responseText)
-              : responseText;
-          const err = parsed?.error || parsed;
-          const code = err?.code || "Error";
-          const msg = err?.message || error?.message || String(error);
-          errorMessage = `${code}: ${msg}`;
-        }
-      } catch {
-        /* ignore */
-      }
-      ztoolkit.log("[AI-Butler] Gemini request error:", {
-        status: error?.xmlhttp?.status,
-        statusText: error?.xmlhttp?.statusText,
-        message: errorMessage,
-      });
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
-      throw new Error(errorMessage, { cause: error });
-    } finally {
-      cleanupAbortSignal?.();
-    }
-
-    return chunks.join("");
+    return requestLLMText({
+      protocol: "gemini",
+      provider: this.id,
+      url: endpoint,
+      headers: mergeRequestHeaders(
+        { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        options.customHeaders,
+      ),
+      payload: payload,
+      options,
+      onProgress,
+    });
   }
 
   async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
@@ -470,6 +204,7 @@ export class GeminiProvider implements ILlmProvider {
       url,
       { "x-goog-api-key": apiKey },
       options.requestTimeoutMs ?? 30000,
+      options.customHeaders,
     );
     return parseModelListResponse(data, { stripModelsPrefix: true });
   }
@@ -510,10 +245,13 @@ export class GeminiProvider implements ILlmProvider {
     const responseHeaders: Record<string, string> = {};
     try {
       response = await Zotero.HTTP.request("POST", url, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
+        headers: mergeRequestHeaders(
+          {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
+          },
+          options.customHeaders,
+        ),
         body: JSON.stringify(payload),
         errorDelayMax: 0,
         responseType: "text", // 使用 text 以获取原始响应
@@ -658,6 +396,7 @@ export class GeminiProvider implements ILlmProvider {
     displayName: string,
     apiKey: string,
     baseUrl: string,
+    customHeaders?: Record<string, string>,
   ): Promise<string> {
     // 读取文件内容
     const fileData = await IOUtils.read(filePath);
@@ -670,14 +409,17 @@ export class GeminiProvider implements ILlmProvider {
     let uploadUrl: string;
     try {
       const startResponse = await Zotero.HTTP.request("POST", startUploadUrl, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-          "X-Goog-Upload-Protocol": "resumable",
-          "X-Goog-Upload-Command": "start",
-          "X-Goog-Upload-Header-Content-Length": String(numBytes),
-          "X-Goog-Upload-Header-Content-Type": mimeType,
-        },
+        headers: mergeRequestHeaders(
+          {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": String(numBytes),
+            "X-Goog-Upload-Header-Content-Type": mimeType,
+          },
+          customHeaders,
+        ),
         body: JSON.stringify({
           file: { display_name: displayName },
         }),
@@ -707,11 +449,14 @@ export class GeminiProvider implements ILlmProvider {
     // 步骤 2: 上传文件内容
     try {
       const uploadResponse = await Zotero.HTTP.request("POST", uploadUrl, {
-        headers: {
-          "Content-Length": String(numBytes),
-          "X-Goog-Upload-Offset": "0",
-          "X-Goog-Upload-Command": "upload, finalize",
-        },
+        headers: mergeRequestHeaders(
+          {
+            "Content-Length": String(numBytes),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+          },
+          customHeaders,
+        ),
         body: new Uint8Array(fileData),
         responseType: "json",
         timeout: 120000, // 文件上传可能需要更长时间
@@ -748,7 +493,8 @@ export class GeminiProvider implements ILlmProvider {
     prompt: string,
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<string> {
+    history: ConversationMessage[] = [],
+  ): Promise<LLMProviderResult> {
     const baseUrl = (
       options.apiUrl || "https://generativelanguage.googleapis.com"
     ).replace(/\/$/, "");
@@ -818,130 +564,24 @@ export class GeminiProvider implements ILlmProvider {
     };
 
     // 发送请求并处理流式响应
-    const chunks: string[] = [];
-    let delivered = 0;
-    let processedLength = 0;
-    let partialLine = "";
-    let gotAnyDelta = false;
-    let abortError: Error | null = null;
-    let cleanupAbortSignal: (() => void) | undefined;
-
-    try {
-      await Zotero.HTTP.request("POST", endpoint, {
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify(payload),
-        responseType: "text",
-        timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
-        errorDelayMax: 0,
-        requestObserver: (xmlhttp: XMLHttpRequest) => {
-          cleanupAbortSignal = bindAbortSignal(
-            options.abortSignal,
-            xmlhttp,
-            (error) => {
-              abortError = error;
-            },
-          );
-          xmlhttp.onprogress = (e: any) => {
-            const status = e.target.status;
-            if (status >= 400) {
-              try {
-                const errorResponse = e.target.response;
-                const parsed = errorResponse ? JSON.parse(errorResponse) : null;
-                const err = parsed?.error || parsed || {};
-                const code = err?.code || `HTTP ${status}`;
-                const msg = err?.message || providerRequestFailed("API");
-                xmlhttp.abort();
-                throw new Error(`${code}: ${msg}`);
-              } catch {
-                xmlhttp.abort();
-                throw new Error(providerHttpRequestFailed(status));
-              }
-            }
-
-            try {
-              const resp: string = e.target.response || "";
-              if (resp.length > processedLength) {
-                const slice = partialLine + resp.slice(processedLength);
-                processedLength = resp.length;
-                const parts = slice.split(/\r?\n/);
-                partialLine =
-                  parts[parts.length - 1].indexOf("data: ") === 0 &&
-                  slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                    ? ""
-                    : parts.pop() || "";
-
-                for (const raw of parts) {
-                  if (raw.indexOf("data: ") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr) continue;
-                  try {
-                    const json = JSON.parse(jsonStr);
-                    recordFinishReason(
-                      options,
-                      "google",
-                      "candidates.finishReason",
-                      json?.candidates?.[0]?.finishReason,
-                    );
-                    const text = this.extractGeminiText(json);
-                    if (text) {
-                      gotAnyDelta = true;
-                      chunks.push(text);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) => {
-                          ztoolkit.log(
-                            "[AI-Butler] onProgress callback error:",
-                            err,
-                          );
-                        });
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-              }
-            } catch (err) {
-              ztoolkit.log("[AI-Butler] Gemini stream parse error:", err);
-            }
-          };
-        },
-      });
-    } catch (error: any) {
-      if (abortError || isAbortError(error, options.abortSignal)) {
-        throw normalizeAbortError(abortError || error, options.abortSignal);
-      }
-      let errorMessage = error?.message || providerRequestFailed("Gemini");
-      try {
-        const responseText =
-          error?.xmlhttp?.response || error?.xmlhttp?.responseText;
-        if (responseText) {
-          const parsed =
-            typeof responseText === "string"
-              ? JSON.parse(responseText)
-              : responseText;
-          const err = parsed?.error || parsed;
-          const code = err?.code || "Error";
-          const msg = err?.message || error?.message || String(error);
-          errorMessage = `${code}: ${msg}`;
-        }
-      } catch {
-        /* ignore */
-      }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
-      throw new Error(errorMessage, { cause: error });
-    } finally {
-      cleanupAbortSignal?.();
-    }
-
-    const streamed = chunks.join("");
-    if (gotAnyDelta && streamed) return streamed;
-    return "";
+    payload.contents.push(
+      ...history.map((message) => ({
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [{ text: message.content }],
+      })),
+    );
+    return requestLLMText({
+      protocol: "gemini",
+      provider: this.id,
+      url: endpoint,
+      headers: mergeRequestHeaders(
+        { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        options.customHeaders,
+      ),
+      payload: payload,
+      options,
+      onProgress,
+    });
   }
 }
 

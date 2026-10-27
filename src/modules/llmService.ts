@@ -17,7 +17,8 @@ import {
   type LLMPdfProcessMode,
 } from "./llmEndpointManager";
 import { ContentExtractor } from "./contentExtractor";
-import { PDFExtractor } from "./pdfExtractor";
+import { EPUBExtractionError } from "./epubExtractor";
+import { PDFExtractor, PDFTextExtractionError } from "./pdfExtractor";
 import type { TaskProgressMeta } from "./taskQueue";
 import { ProviderRegistry } from "./llmproviders/ProviderRegistry";
 import "./llmproviders";
@@ -28,10 +29,16 @@ import {
   resolveReasoningEffort,
 } from "./llmproviders/shared/reasoning";
 import { sanitizeLLMOutputText } from "./llmproviders/shared/outputSanitizer";
-import {
-  isAutoContinuableTruncation,
-  resetTruncationState,
-} from "./llmproviders/shared/truncation";
+import { requestAgentTurn } from "./llmproviders/shared/agentTransport";
+import { parseCustomRequestHeaders } from "./llmproviders/shared/requestHeaders";
+import type {
+  LLMAgentMessage,
+  LLMAgentTurn,
+  LLMAgentStreamUpdate,
+  LLMToolDefinition,
+} from "./llmproviders/agentTypes";
+import { LLMIncompleteError } from "./llmproviders/shared/completion";
+import { getApiRetryDelay, waitForApiRetry } from "./llmproviders/shared/retry";
 import {
   isAbortError,
   normalizeAbortError,
@@ -43,8 +50,10 @@ import type {
   LLMOptions,
   LLMModelInfo,
   LLMProviderCapabilities,
+  LLMProviderResult,
   LLMReasoningEffortSetting,
   LLMResponse,
+  LLMRequestDiagnostics,
   ProgressCb,
 } from "./llmproviders/types";
 
@@ -72,6 +81,8 @@ export type LLMZoteroItemContent = {
   policy?: LLMContentPolicy;
   attachmentMode?: LLMAttachmentMode;
   maxAttachments?: number;
+  /** False prevents extraction from creating notes, attachments, or external files. */
+  persistExtractedContent?: boolean;
 };
 
 export type LLMPdfAttachmentContent = {
@@ -134,6 +145,7 @@ export type LLMLifecycleCallback = (event: LLMLifecycleEvent) => void;
 export type LLMTransportOptions = {
   stream?: boolean;
   timeoutMs?: number;
+  totalTimeoutMs?: number;
   retry?: boolean;
   keyRotation?: boolean;
   abortSignal?: LLMAbortSignal;
@@ -160,6 +172,16 @@ export type LLMChatRequest = {
   transport?: LLMTransportOptions;
   metadata?: Record<string, unknown>;
   onProgress?: ProgressCb;
+};
+
+export type LLMAgentRequest = {
+  messages: LLMAgentMessage[];
+  tools: LLMToolDefinition[];
+  endpointId?: string;
+  generation?: LLMGenerationOptions;
+  transport?: LLMTransportOptions;
+  onProgress?: ProgressCb;
+  onUpdate?: (update: LLMAgentStreamUpdate) => void;
 };
 
 type ResolvedSingleContent = {
@@ -189,6 +211,7 @@ export class LLMApiCallError extends Error {
   public readonly endpointName: string;
   public readonly providerId: string;
   public readonly originalError?: Error;
+  public readonly requestDiagnostics?: LLMRequestDiagnostics;
 
   constructor(endpoint: LLMEndpoint, error: Error) {
     super(error.message);
@@ -197,9 +220,24 @@ export class LLMApiCallError extends Error {
     this.endpointName = endpoint.name;
     this.providerId = endpoint.providerType;
     this.originalError = error;
+    this.requestDiagnostics = (
+      error as Error & {
+        requestDiagnostics?: LLMRequestDiagnostics;
+      }
+    ).requestDiagnostics;
     this.stack = error.stack || this.stack;
   }
 }
+
+export type LLMApiAttemptDiagnostic = {
+  attempt: number;
+  endpointId: string;
+  endpointName: string;
+  providerId: string;
+  elapsedMs: number;
+  error: string;
+  request?: LLMRequestDiagnostics;
+};
 
 export class LLMApiExhaustedError extends Error {
   public readonly suppressTaskRetry = true;
@@ -208,9 +246,22 @@ export class LLMApiExhaustedError extends Error {
   public readonly endpointId?: string;
   public readonly endpointName?: string;
   public readonly providerId?: string;
+  public readonly requestDiagnostics?: LLMRequestDiagnostics;
 
-  constructor(attempts: number, lastError?: Error) {
-    super(lastError?.message || getString("llm-error-all-endpoints-failed"));
+  constructor(
+    attempts: number,
+    lastError?: Error,
+    public readonly attemptDiagnostics: LLMApiAttemptDiagnostic[] = [],
+  ) {
+    super(
+      getString("llm-error-api-exhausted", {
+        args: {
+          attempts,
+          reason:
+            lastError?.message || getString("llm-error-all-endpoints-failed"),
+        },
+      }),
+    );
     this.name = "LLMApiExhaustedError";
     this.attempts = attempts;
     this.lastError = lastError;
@@ -219,11 +270,13 @@ export class LLMApiExhaustedError extends Error {
           endpointId?: string;
           endpointName?: string;
           providerId?: string;
+          requestDiagnostics?: LLMRequestDiagnostics;
         }
       | undefined;
     this.endpointId = apiError?.endpointId;
     this.endpointName = apiError?.endpointName;
     this.providerId = apiError?.providerId;
+    this.requestDiagnostics = apiError?.requestDiagnostics;
     this.stack = lastError?.stack || this.stack;
   }
 }
@@ -231,7 +284,6 @@ export class LLMApiExhaustedError extends Error {
 export class LLMService {
   private static readonly DEFAULT_AUTO_CONTINUATION_ROUNDS = 2;
   private static readonly MAX_AUTO_CONTINUATION_ROUNDS = 10;
-  private static readonly CONTINUATION_TAIL_CHARS = 12000;
   private static readonly CONTINUATION_DEDUPE_LOOKBACK_CHARS = 4000;
   private static readonly CONTINUATION_MIN_OVERLAP_CHARS = 16;
 
@@ -331,9 +383,30 @@ export class LLMService {
     const common: LLMOptions = {
       stream: transport?.stream ?? getPref("stream") ?? true,
       requestTimeoutMs: transport?.timeoutMs ?? this.getRequestTimeout(),
+      requestTotalTimeoutMs: transport?.totalTimeoutMs,
       abortSignal: transport?.abortSignal,
       enablePromptCache:
         (getPref("enablePromptCacheOptimization" as any) as boolean) === true,
+      onActivity: transport?.onStatus
+        ? ({ kind, diagnostics }) => {
+            const content = kind === "content";
+            transport.onStatus?.({
+              stage: content ? "llm-streaming" : "llm-receiving",
+              label: content
+                ? getString("progress-llm-streaming")
+                : getString("progress-llm-receiving"),
+              message: content
+                ? getString("progress-llm-streaming-message")
+                : getString("progress-llm-receiving"),
+              detail: content
+                ? getString("progress-llm-first-chunk-detail")
+                : getString("progress-llm-receiving-detail"),
+              progress: content ? 50 : 47,
+              endpointName: endpoint?.name,
+              model: diagnostics.model,
+            });
+          }
+        : undefined,
     };
 
     if (enableTemperature) {
@@ -346,10 +419,10 @@ export class LLMService {
         generation?.topP ??
         (parseFloat((getPref("topP") as string) || "1.0") || 1.0);
     }
-    if (enableMaxTokens) {
+    if (enableMaxTokens || generation?.maxOutputTokens !== undefined) {
       common.maxTokens =
         generation?.maxOutputTokens ??
-        (parseInt((getPref("maxTokens") as string) || "81920", 10) || 81920);
+        Number((getPref("maxTokens") as string) || "81920");
     }
     const reasoningEffort = resolveReasoningEffort(
       normalizeReasoningEffortSetting(
@@ -370,6 +443,7 @@ export class LLMService {
       common.apiUrl = endpoint.apiUrl.trim();
       common.apiKey = endpoint.apiKey.trim();
       common.model = endpoint.model.trim();
+      common.customHeaders = parseCustomRequestHeaders(endpoint.customHeaders);
     } else if (id.includes("gemini") || id === "google") {
       const keyManagerId = this.mapToKeyManagerId(id);
       common.apiUrl = (
@@ -490,6 +564,84 @@ export class LLMService {
     return (await this.chat(request)).text;
   }
 
+  /** Native tool calling uses the same endpoint, credentials and retry boundary. */
+  static async agentTurn(request: LLMAgentRequest): Promise<LLMAgentTurn> {
+    throwIfAborted(request.transport?.abortSignal);
+    const endpoints = request.endpointId
+      ? [this.getRunnableEndpoint(request.endpointId)]
+      : LLMEndpointManager.prepareRoute().endpoints;
+    const maxAttempts =
+      request.transport?.retry === false
+        ? 1
+        : LLMEndpointManager.getMaxAttemptCount();
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      throwIfAborted(request.transport?.abortSignal);
+      const endpoint =
+        endpoints[
+          request.transport?.keyRotation === false
+            ? 0
+            : attempt % endpoints.length
+        ];
+      try {
+        this.getProviderForEndpoint(endpoint);
+        const options = this.buildOptions(
+          endpoint,
+          request.generation,
+          request.transport,
+          {
+            stream: request.transport?.stream ?? Boolean(request.onUpdate),
+            // Explicit Agent budgets apply even when ordinary generation uses defaults.
+            ...(request.generation?.maxOutputTokens !== undefined
+              ? { maxTokens: request.generation.maxOutputTokens }
+              : {}),
+            ...(request.generation?.temperature !== undefined
+              ? { temperature: request.generation.temperature }
+              : {}),
+            ...(request.generation?.topP !== undefined
+              ? { topP: request.generation.topP }
+              : {}),
+          },
+        );
+        request.transport?.onStatus?.({
+          stage: "llm-waiting",
+          label: getString("progress-llm-waiting"),
+          endpointName: endpoint.name,
+          model: endpoint.model,
+        });
+        return await requestAgentTurn(
+          endpoint.providerType,
+          request.messages,
+          request.tools,
+          options,
+          request.onProgress,
+          request.onUpdate,
+        );
+      } catch (error: unknown) {
+        if (error instanceof LLMIncompleteError) throw error;
+        if (isAbortError(error, request.transport?.abortSignal)) {
+          throw normalizeAbortError(error, request.transport?.abortSignal);
+        }
+        lastError = this.toApiCallError(endpoint, error);
+        // Do not log request/response text: Agent turns can contain library data.
+        ztoolkit.log(
+          `[LLMService] Agent request failed (${attempt + 1}/${maxAttempts}).`,
+        );
+      } finally {
+        if (!request.endpointId)
+          LLMEndpointManager.markEndpointAttempted(endpoint.id);
+      }
+      if (lastError)
+        await this.waitBeforeRetry(
+          lastError,
+          attempt,
+          maxAttempts,
+          request.transport,
+        );
+    }
+    throw new LLMApiExhaustedError(maxAttempts, lastError);
+  }
+
   static async testConnection(): Promise<string> {
     const { id, impl, endpoint } = this.resolveProvider();
     const options = this.buildConnectionTestOptions(id, impl, endpoint);
@@ -606,41 +758,23 @@ export class LLMService {
       .join("\n");
   }
 
-  private static tailForContinuation(text: string): string {
-    if (text.length <= this.CONTINUATION_TAIL_CHARS) return text;
-    return text.slice(-this.CONTINUATION_TAIL_CHARS);
-  }
-
   private static appendAutoContinuationWarning(
     warnings: string[],
     rounds: number,
-    stillTruncated: boolean,
+    result: LLMProviderResult,
   ): void {
-    if (rounds > 0) {
+    if (rounds > 0)
       warnings.push(
         getString("llm-warning-auto-continuation-used", {
           args: { count: rounds },
         }),
       );
-    }
-    if (stillTruncated) {
+    if (result.completion !== "complete")
       warnings.push(
-        rounds > 0
-          ? getString("llm-warning-auto-continuation-still-truncated", {
-              args: { count: rounds },
-            })
-          : getString("llm-warning-auto-continuation-disabled"),
+        getString("llm-error-incomplete-output", {
+          args: { reason: result.finishReason },
+        }),
       );
-    }
-  }
-
-  private static async callProviderAndTrackTruncation(
-    options: LLMOptions,
-    call: () => Promise<string>,
-  ): Promise<string> {
-    resetTruncationState(options);
-    const text = await call();
-    return text;
   }
 
   private static removeContinuationOverlap(
@@ -664,55 +798,80 @@ export class LLMService {
     return continuation;
   }
 
-  private static async autoContinueSingleContent(
-    provider: ILlmProvider,
-    pdfContent: string,
-    isBase64: boolean,
-    initialConversation: ConversationMessage[],
-    initialText: string,
+  private static async continueResult(
+    initial: LLMProviderResult,
     options: LLMOptions,
+    call: (text: string) => Promise<LLMProviderResult>,
     onProgress?: ProgressCb,
-  ): Promise<{ text: string; rounds: number; stillTruncated: boolean }> {
-    let text = "";
+  ): Promise<{
+    result: LLMProviderResult;
+    rounds: number;
+  }> {
+    let result = initial;
     let rounds = 0;
-    const maxRounds = this.getAutoContinuationRounds();
     while (
-      rounds < maxRounds &&
-      isAutoContinuableTruncation(options.truncation)
+      rounds < this.getAutoContinuationRounds() &&
+      result.recovery === "continue"
     ) {
       throwIfAborted(options.abortSignal);
-      rounds += 1;
-      const conversation: ConversationMessage[] = [
-        ...initialConversation,
-        {
-          role: "assistant",
-          content: this.tailForContinuation(initialText + text),
-        },
-        {
-          role: "user",
-          content: this.buildContinuationPrompt(
-            initialConversation[0]?.content || "",
-          ),
-        },
-      ];
-      const continuation = await this.callProviderAndTrackTruncation(
-        options,
-        () =>
-          provider.chat(
-            pdfContent,
-            isBase64,
-            conversation,
-            options,
-            onProgress,
-          ),
-      );
-      text += this.removeContinuationOverlap(initialText + text, continuation);
+      rounds++;
+      let next: LLMProviderResult;
+      try {
+        next = await call(result.text);
+      } catch (error) {
+        if (isAbortError(error, options.abortSignal))
+          throw normalizeAbortError(error, options.abortSignal);
+        result = {
+          ...result,
+          completion: "partial",
+          recovery: "retry",
+          finishReason: "continuation_failed",
+          error: error instanceof Error ? error.message : String(error),
+        };
+        break;
+      }
+      const added = this.removeContinuationOverlap(result.text, next.text);
+      const sumKnown = (a?: number, b?: number) =>
+        a !== undefined && b !== undefined ? a + b : undefined;
+      const usage = {
+        inputTokens: sumKnown(
+          result.usage?.inputTokens,
+          next.usage?.inputTokens,
+        ),
+        outputTokens: sumKnown(
+          result.usage?.outputTokens,
+          next.usage?.outputTokens,
+        ),
+        totalTokens: sumKnown(
+          result.usage?.totalTokens,
+          next.usage?.totalTokens,
+        ),
+      };
+      // A duplicate/empty continuation is not evidence that the missing answer was completed.
+      if (!added.trim() || result.text.includes(next.text.trim())) {
+        result = {
+          ...next,
+          text: result.text,
+          usage,
+          completion: "partial",
+          recovery: "none",
+          finishReason:
+            next.completion === "partial" && next.recovery !== "continue"
+              ? next.finishReason
+              : "continuation_no_progress",
+        };
+        break;
+      }
+      result = { ...next, usage, text: result.text + added };
+      // Deliver only the reconciled addition, so the preview matches the saved result.
+      try {
+        await onProgress?.(added);
+      } catch (error) {
+        ztoolkit.log("[AI-Butler] Continuation callback failed:", error);
+      }
     }
-    return {
-      text,
-      rounds,
-      stillTruncated: isAutoContinuableTruncation(options.truncation),
-    };
+    result.continuationRounds = rounds;
+    return { result, rounds };
   }
 
   private static async autoContinueSummaryText(
@@ -720,27 +879,19 @@ export class LLMService {
     pdfContent: string,
     isBase64: boolean,
     prompt: string,
-    initialText: string,
+    initial: LLMProviderResult,
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<{ text: string; rounds: number; stillTruncated: boolean }> {
-    const initialConversation: ConversationMessage[] = [
-      { role: "user", content: prompt || "" },
-    ];
-    const continued = await this.autoContinueSingleContent(
+  ) {
+    return this.autoContinueChatText(
       provider,
       pdfContent,
       isBase64,
-      initialConversation,
-      initialText,
+      [{ role: "user", content: prompt }],
+      initial,
       options,
       onProgress,
     );
-    return {
-      text: initialText + continued.text,
-      rounds: continued.rounds,
-      stillTruncated: continued.stillTruncated,
-    };
   }
 
   private static async autoContinueChatText(
@@ -748,72 +899,124 @@ export class LLMService {
     pdfContent: string,
     isBase64: boolean,
     conversation: ConversationMessage[],
-    initialText: string,
+    initial: LLMProviderResult,
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<{ text: string; rounds: number; stillTruncated: boolean }> {
-    const baseConversation =
-      conversation && conversation.length > 0
-        ? conversation
-        : [{ role: "user", content: "" } as ConversationMessage];
-    const continued = await this.autoContinueSingleContent(
-      provider,
-      pdfContent,
-      isBase64,
-      baseConversation,
-      initialText,
+  ) {
+    const task =
+      [...conversation].reverse().find((message) => message.role === "user")
+        ?.content || "";
+    return this.continueResult(
+      initial,
       options,
+      (text) =>
+        provider.chat(
+          pdfContent,
+          isBase64,
+          [
+            ...conversation,
+            { role: "assistant", content: text },
+            { role: "user", content: this.buildContinuationPrompt(task) },
+          ],
+          options,
+        ),
       onProgress,
     );
-    return {
-      text: initialText + continued.text,
-      rounds: continued.rounds,
-      stillTruncated: continued.stillTruncated,
-    };
   }
 
   private static async autoContinueMultiFileSummary(
     provider: ILlmProvider,
     files: PdfFileInfo[],
     prompt: string,
-    initialText: string,
+    initial: LLMProviderResult,
     options: LLMOptions,
     onProgress?: ProgressCb,
-  ): Promise<{ text: string; rounds: number; stillTruncated: boolean }> {
-    if (typeof provider.generateMultiFileSummary !== "function") {
-      return {
-        text: initialText,
-        rounds: 0,
-        stillTruncated: isAutoContinuableTruncation(options.truncation),
-      };
+  ) {
+    return this.continueResult(
+      initial,
+      options,
+      (text) =>
+        provider.generateMultiFileSummary!(files, prompt, options, undefined, [
+          { role: "assistant", content: text },
+          { role: "user", content: this.buildContinuationPrompt(prompt) },
+        ]),
+      onProgress,
+    );
+  }
+
+  private static async waitBeforeRetry(
+    error: Error,
+    attempt: number,
+    maxAttempts: number,
+    transport?: LLMTransportOptions,
+  ): Promise<void> {
+    if (attempt + 1 >= maxAttempts) return;
+    const delayMs = getApiRetryDelay(error, attempt);
+    if (delayMs > 0) {
+      const label = getString("progress-llm-retrying", {
+        args: {
+          attempt: attempt + 2,
+          maxAttempts,
+          seconds: Math.ceil(delayMs / 1000),
+        },
+      });
+      transport?.onStatus?.({
+        stage: "llm-retrying",
+        label,
+        message: label,
+        progress: 45,
+        attempt: attempt + 2,
+        maxAttempts,
+      });
     }
-    let text = initialText;
-    let rounds = 0;
-    const maxRounds = this.getAutoContinuationRounds();
-    while (
-      rounds < maxRounds &&
-      isAutoContinuableTruncation(options.truncation)
-    ) {
-      throwIfAborted(options.abortSignal);
-      rounds += 1;
-      const continuationPrompt = `${this.buildContinuationPrompt(prompt)}\n\nPrevious response tail:\n${this.tailForContinuation(text)}`;
-      const continuation = await this.callProviderAndTrackTruncation(
-        options,
-        () =>
-          provider.generateMultiFileSummary!(
-            files,
-            continuationPrompt,
-            options,
-            onProgress,
-          ),
-      );
-      text += this.removeContinuationOverlap(text, continuation);
+    await waitForApiRetry(delayMs, transport?.abortSignal);
+  }
+
+  private static async runEndpointAttempts<T>(
+    endpoints: LLMEndpoint[],
+    maxAttempts: number,
+    transport: LLMTransportOptions | undefined,
+    markAttempted: boolean,
+    call: (endpoint: LLMEndpoint) => Promise<T>,
+  ): Promise<T> {
+    let lastError: LLMApiCallError | undefined;
+    const attempts: LLMApiAttemptDiagnostic[] = [];
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      throwIfAborted(transport?.abortSignal);
+      const endpoint = endpoints[attempt % endpoints.length];
+      const started = Date.now();
+      try {
+        const response = await call(endpoint);
+        if (markAttempted)
+          LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        return response;
+      } catch (error: unknown) {
+        if (error instanceof LLMIncompleteError) throw error;
+        if (isAbortError(error, transport?.abortSignal)) {
+          throw normalizeAbortError(error, transport?.abortSignal);
+        }
+        const extractionError = PDFTextExtractionError.find(error);
+        if (extractionError) throw extractionError;
+        if (error instanceof EPUBExtractionError) throw error;
+        if (markAttempted)
+          LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        lastError = this.toApiCallError(endpoint, error);
+        attempts.push({
+          attempt: attempt + 1,
+          endpointId: endpoint.id,
+          endpointName: endpoint.name,
+          providerId: endpoint.providerType,
+          elapsedMs: Date.now() - started,
+          error: lastError.message,
+          request: lastError.requestDiagnostics,
+        });
+        ztoolkit.log(
+          `[LLMService] API failed via ${endpoint.name} (${attempt + 1}/${maxAttempts}): ${lastError.message}`,
+        );
+        await this.waitBeforeRetry(lastError, attempt, maxAttempts, transport);
+      }
     }
-    return {
-      text,
-      rounds,
-      stillTruncated: isAutoContinuableTruncation(options.truncation),
-    };
+    throw new LLMApiExhaustedError(attempts.length, lastError, attempts);
   }
 
   private static async runGenerateWithEndpointRouting(
@@ -821,34 +1024,13 @@ export class LLMService {
     prompt: string,
   ): Promise<LLMResponse> {
     const route = LLMEndpointManager.prepareRoute();
-    const useRetry = request.transport?.retry ?? true;
-    const maxRetries = useRetry ? route.maxAttempts : 1;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      throwIfAborted(request.transport?.abortSignal);
-      const endpoint = route.endpoints[attempt % route.endpoints.length];
-      try {
-        const response = await this.generateOnceWithEndpoint(
-          endpoint,
-          request,
-          prompt,
-        );
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
-        return response;
-      } catch (error: unknown) {
-        if (isAbortError(error, request.transport?.abortSignal)) {
-          throw normalizeAbortError(error, request.transport?.abortSignal);
-        }
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
-        lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] API failed via ${endpoint.name} (${attempt + 1}/${maxRetries}): ${lastError.message}`,
-        );
-      }
-    }
-
-    throw new LLMApiExhaustedError(maxRetries, lastError || undefined);
+    return this.runEndpointAttempts(
+      route.endpoints,
+      request.transport?.retry === false ? 1 : route.maxAttempts,
+      request.transport,
+      true,
+      (endpoint) => this.generateOnceWithEndpoint(endpoint, request, prompt),
+    );
   }
 
   private static async generateOnceWithEndpoint(
@@ -884,6 +1066,7 @@ export class LLMService {
               progress,
             })
         : undefined,
+      request.transport?.abortSignal,
     );
     throwIfAborted(request.transport?.abortSignal);
     const options = this.buildOptions(
@@ -906,24 +1089,7 @@ export class LLMService {
         },
       }),
     });
-    let sawFirstChunk = false;
-    const progressProxy: ProgressCb | undefined = request.onProgress
-      ? async (chunk: string) => {
-          if (!sawFirstChunk) {
-            sawFirstChunk = true;
-            request.transport?.onStatus?.({
-              stage: "llm-streaming",
-              label: getString("progress-llm-streaming"),
-              message: getString("progress-llm-streaming-message"),
-              progress: 50,
-              endpointName: endpoint.name,
-              model: options.model || endpoint.model,
-              detail: getString("progress-llm-first-chunk-detail"),
-            });
-          }
-          await request.onProgress?.(chunk);
-        }
-      : undefined;
+    const progressProxy = request.onProgress;
     request.transport?.onStatus?.({
       stage: "llm-waiting",
       label: getString("progress-llm-waiting"),
@@ -933,7 +1099,7 @@ export class LLMService {
       model: options.model || endpoint.model,
       detail: getString("progress-llm-waiting-detail"),
     });
-    let text: string;
+    let result: LLMProviderResult;
     if (resolved.mode === "multi-file") {
       if (typeof provider.generateMultiFileSummary !== "function") {
         throw new Error(
@@ -943,29 +1109,28 @@ export class LLMService {
         );
       }
       try {
-        text = await this.callProviderAndTrackTruncation(options, () =>
-          provider.generateMultiFileSummary!(
-            resolved.files,
-            prompt,
-            options,
-            progressProxy,
-          ),
+        result = await provider.generateMultiFileSummary!(
+          resolved.files,
+          prompt,
+          options,
+          progressProxy,
         );
         const continued = await this.autoContinueMultiFileSummary(
           provider,
           resolved.files,
           prompt,
-          text,
+          result,
           options,
           progressProxy,
         );
-        text = continued.text;
+        result = continued.result;
         this.appendAutoContinuationWarning(
           warnings,
           continued.rounds,
-          continued.stillTruncated,
+          continued.result,
         );
       } catch (error: unknown) {
+        if (error instanceof LLMIncompleteError) throw error;
         if (isAbortError(error, options.abortSignal)) {
           throw normalizeAbortError(error, options.abortSignal);
         }
@@ -973,37 +1138,37 @@ export class LLMService {
       }
     } else {
       try {
-        text = await this.callProviderAndTrackTruncation(options, () =>
-          provider.generateSummary(
-            resolved.content,
-            resolved.isBase64,
-            prompt,
-            options,
-            progressProxy,
-          ),
+        result = await provider.generateSummary(
+          resolved.content,
+          resolved.isBase64,
+          prompt,
+          options,
+          progressProxy,
         );
         const continued = await this.autoContinueSummaryText(
           provider,
           resolved.content,
           resolved.isBase64,
           prompt,
-          text,
+          result,
           options,
           progressProxy,
         );
-        text = continued.text;
+        result = continued.result;
         this.appendAutoContinuationWarning(
           warnings,
           continued.rounds,
-          continued.stillTruncated,
+          continued.result,
         );
       } catch (error: unknown) {
+        if (error instanceof LLMIncompleteError) throw error;
         if (isAbortError(error, options.abortSignal)) {
           throw normalizeAbortError(error, options.abortSignal);
         }
         throw this.toApiCallError(endpoint, error);
       }
     }
+    this.assertCompleteResult(result, endpoint, options, warnings);
     request.transport?.onStatus?.({
       stage: "llm-streaming",
       label: getString("progress-llm-complete"),
@@ -1012,11 +1177,11 @@ export class LLMService {
       endpointName: endpoint.name,
       model: options.model || endpoint.model,
       detail: getString("progress-llm-complete-detail", {
-        args: { count: text.length },
+        args: { count: result.text.length },
       }),
     });
     return this.toResponse(
-      text,
+      result,
       endpoint.providerType,
       endpoint,
       options,
@@ -1029,56 +1194,28 @@ export class LLMService {
     request: LLMGenerateRequest,
     prompt: string,
   ): Promise<LLMResponse> {
-    const useRetry = request.transport?.retry ?? true;
-    const maxAttempts = useRetry ? LLMEndpointManager.getMaxAttemptCount() : 1;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      throwIfAborted(request.transport?.abortSignal);
-      try {
-        return await this.generateOnceWithEndpoint(endpoint, request, prompt);
-      } catch (error: unknown) {
-        if (isAbortError(error, request.transport?.abortSignal)) {
-          throw normalizeAbortError(error, request.transport?.abortSignal);
-        }
-        lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] API failed via ${endpoint.name} (${attempt + 1}/${maxAttempts}): ${lastError.message}`,
-        );
-      }
-    }
-
-    throw new LLMApiExhaustedError(maxAttempts, lastError || undefined);
+    return this.runEndpointAttempts(
+      [endpoint],
+      request.transport?.retry === false
+        ? 1
+        : LLMEndpointManager.getMaxAttemptCount(),
+      request.transport,
+      false,
+      () => this.generateOnceWithEndpoint(endpoint, request, prompt),
+    );
   }
 
   private static async chatWithEndpointRouting(
     request: LLMChatRequest,
     route: ReturnType<typeof LLMEndpointManager.prepareRoute>,
   ): Promise<LLMResponse> {
-    const useRetry = request.transport?.retry ?? true;
-    const maxRetries = useRetry ? route.maxAttempts : 1;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      throwIfAborted(request.transport?.abortSignal);
-      const endpoint = route.endpoints[attempt % route.endpoints.length];
-      try {
-        const response = await this.chatOnceWithEndpoint(endpoint, request);
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
-        return response;
-      } catch (error: unknown) {
-        if (isAbortError(error, request.transport?.abortSignal)) {
-          throw normalizeAbortError(error, request.transport?.abortSignal);
-        }
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
-        lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] Chat API failed via ${endpoint.name} (${attempt + 1}/${maxRetries}): ${lastError.message}`,
-        );
-      }
-    }
-
-    throw new LLMApiExhaustedError(maxRetries, lastError || undefined);
+    return this.runEndpointAttempts(
+      route.endpoints,
+      request.transport?.retry === false ? 1 : route.maxAttempts,
+      request.transport,
+      true,
+      (endpoint) => this.chatOnceWithEndpoint(endpoint, request),
+    );
   }
 
   private static async chatOnceWithEndpoint(
@@ -1113,6 +1250,7 @@ export class LLMService {
               progress,
             })
         : undefined,
+      request.transport?.abortSignal,
     );
     throwIfAborted(request.transport?.abortSignal);
     if (resolved.mode !== "single") {
@@ -1138,24 +1276,7 @@ export class LLMService {
         },
       }),
     });
-    let sawFirstChunk = false;
-    const progressProxy: ProgressCb | undefined = request.onProgress
-      ? async (chunk: string) => {
-          if (!sawFirstChunk) {
-            sawFirstChunk = true;
-            request.transport?.onStatus?.({
-              stage: "llm-streaming",
-              label: getString("progress-llm-streaming"),
-              message: getString("progress-llm-streaming-message"),
-              progress: 50,
-              endpointName: endpoint.name,
-              model: options.model || endpoint.model,
-              detail: getString("progress-llm-first-chunk-detail"),
-            });
-          }
-          await request.onProgress?.(chunk);
-        }
-      : undefined;
+    const progressProxy = request.onProgress;
     request.transport?.onStatus?.({
       stage: "llm-waiting",
       label: getString("progress-llm-waiting"),
@@ -1165,38 +1286,38 @@ export class LLMService {
       model: options.model || endpoint.model,
       detail: getString("progress-llm-waiting-detail"),
     });
-    let text: string;
+    let result: LLMProviderResult;
     try {
-      text = await this.callProviderAndTrackTruncation(options, () =>
-        provider.chat(
-          resolved.content,
-          resolved.isBase64,
-          request.conversation,
-          options,
-          progressProxy,
-        ),
+      result = await provider.chat(
+        resolved.content,
+        resolved.isBase64,
+        request.conversation,
+        options,
+        progressProxy,
       );
       const continued = await this.autoContinueChatText(
         provider,
         resolved.content,
         resolved.isBase64,
         request.conversation,
-        text,
+        result,
         options,
         progressProxy,
       );
-      text = continued.text;
+      result = continued.result;
       this.appendAutoContinuationWarning(
         warnings,
         continued.rounds,
-        continued.stillTruncated,
+        continued.result,
       );
     } catch (error: unknown) {
+      if (error instanceof LLMIncompleteError) throw error;
       if (isAbortError(error, options.abortSignal)) {
         throw normalizeAbortError(error, options.abortSignal);
       }
       throw this.toApiCallError(endpoint, error);
     }
+    this.assertCompleteResult(result, endpoint, options, warnings);
     request.transport?.onStatus?.({
       stage: "llm-streaming",
       label: getString("progress-llm-complete"),
@@ -1205,11 +1326,11 @@ export class LLMService {
       endpointName: endpoint.name,
       model: options.model || endpoint.model,
       detail: getString("progress-llm-complete-detail", {
-        args: { count: text.length },
+        args: { count: result.text.length },
       }),
     });
     return this.toResponse(
-      text,
+      result,
       endpoint.providerType,
       endpoint,
       options,
@@ -1221,26 +1342,15 @@ export class LLMService {
     endpoint: LLMEndpoint,
     request: LLMChatRequest,
   ): Promise<LLMResponse> {
-    const useRetry = request.transport?.retry ?? true;
-    const maxAttempts = useRetry ? LLMEndpointManager.getMaxAttemptCount() : 1;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      throwIfAborted(request.transport?.abortSignal);
-      try {
-        return await this.chatOnceWithEndpoint(endpoint, request);
-      } catch (error: unknown) {
-        if (isAbortError(error, request.transport?.abortSignal)) {
-          throw normalizeAbortError(error, request.transport?.abortSignal);
-        }
-        lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] Chat API failed via ${endpoint.name} (${attempt + 1}/${maxAttempts}): ${lastError.message}`,
-        );
-      }
-    }
-
-    throw new LLMApiExhaustedError(maxAttempts, lastError || undefined);
+    return this.runEndpointAttempts(
+      [endpoint],
+      request.transport?.retry === false
+        ? 1
+        : LLMEndpointManager.getMaxAttemptCount(),
+      request.transport,
+      false,
+      () => this.chatOnceWithEndpoint(endpoint, request),
+    );
   }
 
   private static toApiCallError(
@@ -1253,73 +1363,35 @@ export class LLMService {
     );
   }
 
-  private static async runWithRetry(
-    providerId: string,
-    provider: ILlmProvider,
-    request: LLMGenerateRequest,
-    resolved: ResolvedContent,
-    prompt: string,
+  private static assertCompleteResult(
+    result: LLMProviderResult,
+    endpoint: LLMEndpoint,
+    options: LLMOptions,
     warnings: string[],
-  ): Promise<LLMResponse> {
-    const keyManagerId = this.mapToKeyManagerId(providerId);
-    const useRetry = request.transport?.retry ?? true;
-    const useKeyRotation = request.transport?.keyRotation ?? true;
-    const maxRetries = useRetry ? ApiKeyManager.getMaxSwitchCount() : 1;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      throwIfAborted(request.transport?.abortSignal);
-      try {
-        const options = this.buildOptions(
-          providerId,
-          request.generation,
-          request.transport,
-        );
-        let text: string;
-        if (resolved.mode === "multi-file") {
-          if (typeof provider.generateMultiFileSummary !== "function") {
-            throw new Error(
-              getString("llm-error-multifile-unsupported", {
-                args: { provider: providerId },
-              }),
-            );
-          }
-          text = await provider.generateMultiFileSummary(
-            resolved.files,
-            prompt,
-            options,
-            request.onProgress,
-          );
-        } else {
-          text = await provider.generateSummary(
-            resolved.content,
-            resolved.isBase64,
-            prompt,
-            options,
-            request.onProgress,
-          );
-        }
-        if (useKeyRotation) ApiKeyManager.advanceToNextKey(keyManagerId);
-        return this.toResponse(text, providerId, options, warnings);
-      } catch (error: unknown) {
-        if (isAbortError(error, request.transport?.abortSignal)) {
-          throw normalizeAbortError(error, request.transport?.abortSignal);
-        }
-        lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] API 调用失败 (尝试 ${attempt + 1}/${maxRetries}): ${lastError.message}`,
-        );
-        if (!useKeyRotation) break;
-        const rotated = ApiKeyManager.rotateToNextKey(keyManagerId);
-        if (!rotated) break;
-      }
+  ): void {
+    if (
+      result.completion === "complete" &&
+      !sanitizeLLMOutputText(result.text).trim()
+    ) {
+      result.completion = "partial";
+      result.recovery = "none";
+      result.finishReason = "empty_output";
     }
-
-    throw lastError || new Error(getString("llm-error-api-keys-exhausted"));
+    if (result.completion !== "complete") {
+      throw new LLMIncompleteError(
+        this.toResponse(
+          result,
+          endpoint.providerType,
+          endpoint,
+          options,
+          warnings,
+        ),
+      );
+    }
   }
 
   private static toResponse(
-    text: string,
+    result: LLMProviderResult,
     providerId: string,
     endpointOrOptions: LLMEndpoint | LLMOptions,
     optionsOrWarnings: LLMOptions | string[],
@@ -1333,6 +1405,7 @@ export class LLMService {
     const warnings = endpoint
       ? maybeWarnings || []
       : (optionsOrWarnings as string[]);
+    const text = result.text;
     const sanitizedText = sanitizeLLMOutputText(text);
     if (sanitizedText !== text) {
       ztoolkit.log(
@@ -1341,6 +1414,14 @@ export class LLMService {
     }
     return {
       text: sanitizedText,
+      completion: result.completion,
+      recovery: result.recovery,
+      finishReason: result.finishReason,
+      usage: result.usage,
+      requestId: result.requestId,
+      maxOutputTokens: result.maxOutputTokens,
+      continuationRounds: result.continuationRounds,
+      requestDiagnostics: result.requestDiagnostics,
       providerId,
       endpointId: endpoint?.id,
       providerName:
@@ -1362,7 +1443,9 @@ export class LLMService {
       progress: number,
       meta?: TaskProgressMeta,
     ) => void,
+    abortSignal?: LLMAbortSignal,
   ): Promise<ResolvedContent> {
+    throwIfAborted(abortSignal);
     if (input.kind === "text") {
       return { mode: "single", content: input.text, isBase64: false, warnings };
     }
@@ -1390,6 +1473,7 @@ export class LLMService {
         warnings,
         allowMultiFile,
         statusCallback,
+        abortSignal,
       );
     }
 
@@ -1399,6 +1483,7 @@ export class LLMService {
         policy,
         warnings,
         statusCallback,
+        abortSignal,
       );
     }
 
@@ -1408,6 +1493,7 @@ export class LLMService {
         policy,
         warnings,
         statusCallback,
+        abortSignal,
       );
     }
 
@@ -1454,6 +1540,7 @@ export class LLMService {
       progress: number,
       meta?: TaskProgressMeta,
     ) => void,
+    abortSignal?: LLMAbortSignal,
   ): Promise<ResolvedContent> {
     const attachmentMode =
       input.attachmentMode ||
@@ -1461,22 +1548,26 @@ export class LLMService {
       "default";
     const maxAttachments = Math.max(input.maxAttachments || Infinity, 1);
     const pdfAttachments = await PDFExtractor.getAllPdfAttachments(input.item);
+    throwIfAborted(abortSignal);
     const hasPdf = pdfAttachments.length > 0;
 
     if (!hasPdf) {
-      const snapshotContent =
+      const textContent =
         await ContentExtractor.extractAnalyzableContentFromItem(
           input.item,
           false,
           policy === "mineru" ? "mineru" : "text",
           statusCallback,
+          { persist: input.persistExtractedContent, abortSignal },
         );
-      if (snapshotContent.kind === "web-snapshot") {
+      if (textContent.kind === "web-snapshot") {
         warnings.push(getString("llm-warning-web-snapshot-used"));
+      } else if (textContent.kind === "epub") {
+        warnings.push(getString("llm-warning-epub-used"));
       }
       return {
         mode: "single",
-        content: this.normalizeText(snapshotContent.content),
+        content: this.normalizeText(textContent.content),
         isBase64: false,
         warnings,
       };
@@ -1522,6 +1613,7 @@ export class LLMService {
       const content = await PDFExtractor.extractBase64FromItem(
         input.item,
         statusCallback,
+        abortSignal,
       );
       return { mode: "single", content, isBase64: true, warnings };
     }
@@ -1532,7 +1624,10 @@ export class LLMService {
         selected.map(async (pdf, index) => {
           const title =
             String(pdf.getField("title") || "").trim() || "PDF-" + (index + 1);
-          const text = await PDFExtractor.extractTextFromAttachment(pdf);
+          const text = await PDFExtractor.extractTextFromAttachment(
+            pdf,
+            abortSignal,
+          );
           return "\n\n=== " + title + " ===\n" + this.normalizeText(text);
         }),
       );
@@ -1548,6 +1643,7 @@ export class LLMService {
       input.item,
       policy,
       statusCallback,
+      { persist: input.persistExtractedContent, abortSignal },
     );
     return {
       mode: "single",
@@ -1566,6 +1662,7 @@ export class LLMService {
       progress: number,
       meta?: TaskProgressMeta,
     ) => void,
+    abortSignal?: LLMAbortSignal,
   ): Promise<ResolvedContent> {
     if (policy === "pdf-base64") {
       const content = await PDFExtractor.extractBase64FromAttachment(
@@ -1580,8 +1677,12 @@ export class LLMService {
             input.item,
             "mineru",
             statusCallback,
+            { abortSignal },
           )
-        : await PDFExtractor.extractTextFromAttachment(input.attachment);
+        : await PDFExtractor.extractTextFromAttachment(
+            input.attachment,
+            abortSignal,
+          );
     return {
       mode: "single",
       content: this.normalizeText(text),
@@ -1599,6 +1700,7 @@ export class LLMService {
       progress: number,
       meta?: TaskProgressMeta,
     ) => void,
+    abortSignal?: LLMAbortSignal,
   ): Promise<ResolvedContent> {
     if (PDFExtractor.isPdfAttachment(input.attachment)) {
       return this.resolvePdfAttachmentContent(
@@ -1611,6 +1713,7 @@ export class LLMService {
         policy,
         warnings,
         statusCallback,
+        abortSignal,
       );
     }
 
@@ -1620,6 +1723,7 @@ export class LLMService {
 
     const text = await ContentExtractor.extractTextFromAnalyzableAttachment(
       input.attachment,
+      abortSignal,
     );
     return {
       mode: "single",

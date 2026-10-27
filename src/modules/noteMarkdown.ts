@@ -142,6 +142,26 @@ export function zoteroNoteMathHtml(content: string, isBlock: boolean): string {
  * Convert Markdown into the HTML dialect Zotero notes can render, including
  * Zotero-native math spans. Shared by summary notes and saved follow-up chats.
  */
+export function replaceInlineMath(
+  text: string,
+  render: (formula: string) => string,
+): string {
+  const expression = /(\$(?!\$)|\\\()([^$\n]+?)(\$(?!\$)|\\\))/g;
+  let renderedText = "";
+  let copiedUntil = 0;
+  let match: RegExpExecArray | null;
+  while ((match = expression.exec(text))) {
+    if (match[1] === "$" && text[match.index - 1] === "$") {
+      // Without lookbehind, a rejected delimiter must not consume the next formula.
+      expression.lastIndex = match.index + 1;
+      continue;
+    }
+    renderedText += text.slice(copiedUntil, match.index) + render(match[2]);
+    copiedUntil = expression.lastIndex;
+  }
+  return renderedText + text.slice(copiedUntil);
+}
+
 export function markdownToZoteroNoteHtml(markdown: string): string {
   const formulas: ProtectedFormula[] = [];
   let processedMarkdown = stripInvalidXmlChars(markdown);
@@ -157,15 +177,11 @@ export function markdownToZoteroNoteHtml(markdown: string): string {
 
   processedMarkdown = normalizeMarkdownBlockBoundaries(processedMarkdown);
 
-  processedMarkdown = processedMarkdown.replace(
-    // eslint-disable-next-line no-useless-escape
-    /((?<!\$)\$(?!\$)|\\\()([^\$\n]+?)((?<!\$)\$(?!\$)|\\\))/g,
-    (_match, _start, formula) => {
-      const placeholder = `FORMULA_INLINE_${formulas.length}_END`;
-      formulas.push({ content: formula.trim(), isBlock: false });
-      return placeholder;
-    },
-  );
+  processedMarkdown = replaceInlineMath(processedMarkdown, (formula) => {
+    const placeholder = `FORMULA_INLINE_${formulas.length}_END`;
+    formulas.push({ content: formula.trim(), isBlock: false });
+    return placeholder;
+  });
 
   processedMarkdown = processedMarkdown.replace(
     // eslint-disable-next-line no-useless-escape
@@ -231,42 +247,106 @@ function normalizeMarkdownBlockBoundaries(markdown: string): string {
     .replace(/\n{3,}/g, "\n\n");
 }
 
+const DISPLAY_MATH_ENVIRONMENTS =
+  "equation\\*?|align\\*?|gather\\*?|multline\\*?|eqnarray\\*?";
+
+function protectDisplayCode(markdown: string): {
+  text: string;
+  codeBlocks: string[];
+} {
+  const codeBlocks: string[] = [];
+  const protect = (match: string): string => {
+    const placeholder = `AIBUTLERCODEBLOCK${codeBlocks.length}END`;
+    codeBlocks.push(match);
+    return placeholder;
+  };
+  const text = markdown
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/`[^`\n]+`/g, protect);
+  return { text, codeBlocks };
+}
+
+function prepareDisplayMathContent(raw: string): string {
+  const withBreaks = String(raw ?? "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?p>/gi, "\n");
+  return normalizeLatexForKatex(withBreaks).replace(
+    /^\s*\\displaystyle\s+/,
+    "",
+  );
+}
+
+function renderKatexHtml(content: string, isBlock: boolean): string {
+  const options = {
+    throwOnError: false,
+    displayMode: isBlock,
+    output: "html" as const,
+    trust: true,
+    strict: false as const,
+  };
+  let rendered = katex.renderToString(content, options);
+  // Models sometimes double-escape commands (\\frac). Retry once unescaped.
+  if (rendered.includes("katex-error") && /\\\\[a-zA-Z]+/.test(content)) {
+    const retry = katex.renderToString(content.replace(/\\\\/g, "\\"), options);
+    if (!retry.includes("katex-error")) rendered = retry;
+  }
+  return rendered;
+}
+
 /**
  * Convert Markdown into display HTML for plugin UI surfaces, including KaTeX
  * rendering for LaTeX formulas.
+ *
+ * Math is extracted before Markdown parsing so multiline `\(...\)`, display
+ * delimiters, and ams environments are not shredded. Fenced and inline code
+ * is protected first so literal dollars inside code stay literal.
  */
 export function markdownToDisplayHtml(markdown: string): string {
   const formulas: ProtectedFormula[] = [];
-  let html = stripInvalidXmlChars(markdown);
+  const protectedCode = protectDisplayCode(
+    stripInvalidXmlChars(String(markdown ?? "")).replace(/\r\n?/g, "\n"),
+  );
+  let html = protectedCode.text;
 
   html = html.replace(/\$\$\$([\s\S]*?)\$\$\$/g, (_match, formula: string) => {
     return `$$${formula.trim()}$$`;
   });
+  // Some models emit double-escaped delimiters: \\( \\) \\[ \\]
+  html = html.replace(/\\\\([()[\]])/g, "\\$1");
 
-  html = html.replace(/\\\[([\s\S]*?)\\\]/g, (_match, formula) => {
-    const placeholder = `AI_BUTLER_FORMULA_BLOCK_${formulas.length}_END`;
-    formulas.push({ content: formula.trim(), isBlock: true });
+  const pushFormula = (content: string, isBlock: boolean): string => {
+    const placeholder = `AI_BUTLER_FORMULA_${isBlock ? "BLOCK" : "INLINE"}_${formulas.length}_END`;
+    formulas.push({ content: String(content || "").trim(), isBlock });
     return placeholder;
-  });
+  };
 
-  html = html.replace(/\$\$([\s\S]*?)\$\$/g, (_match, formula) => {
-    const placeholder = `AI_BUTLER_FORMULA_BLOCK_${formulas.length}_END`;
-    formulas.push({ content: formula.trim(), isBlock: true });
-    return placeholder;
-  });
+  html = html.replace(/\\\[([\s\S]*?)\\\]/g, (_match, formula: string) =>
+    pushFormula(formula, true),
+  );
+  html = html.replace(/\$\$([\s\S]*?)\$\$/g, (_match, formula: string) =>
+    pushFormula(formula, true),
+  );
+  html = html.replace(
+    new RegExp(
+      `\\\\begin\\{(${DISPLAY_MATH_ENVIRONMENTS})\\}([\\s\\S]*?)\\\\end\\{\\1\\}`,
+      "g",
+    ),
+    (match) => pushFormula(match, true),
+  );
+  html = html.replace(/\\\(([\s\S]*?)\\\)/g, (_match, formula: string) =>
+    pushFormula(formula, false),
+  );
+  html = html.replace(
+    /(^|[^$])\$(?!\$)((?:\\\$|[^$\n])+?)\$(?!\$)/g,
+    (_match, prefix: string, formula: string) =>
+      `${prefix}${pushFormula(formula, false)}`,
+  );
 
-  html = html.replace(/\\\((.*?)\\\)/g, (_match, formula) => {
-    const placeholder = `AI_BUTLER_FORMULA_INLINE_${formulas.length}_END`;
-    formulas.push({ content: formula.trim(), isBlock: false });
-    return placeholder;
-  });
-
-  // eslint-disable-next-line no-useless-escape
-  html = html.replace(/\$([^\$\n]+?)\$/g, (_match, formula) => {
-    const placeholder = `AI_BUTLER_FORMULA_INLINE_${formulas.length}_END`;
-    formulas.push({ content: formula.trim(), isBlock: false });
-    return placeholder;
-  });
+  html = html.replace(
+    /AIBUTLERCODEBLOCK(\d+)END/g,
+    (_match, index: string) =>
+      protectedCode.codeBlocks[parseInt(index, 10)] ?? _match,
+  );
 
   marked.setOptions({
     breaks: true,
@@ -280,20 +360,14 @@ export function markdownToDisplayHtml(markdown: string): string {
   }
 
   const renderFormula = (_match: string, _type: string, index: string) => {
-    const formulaData = formulas[parseInt(index)];
+    const formulaData = formulas[parseInt(index, 10)];
     if (!formulaData) return _match;
 
-    const content = normalizeLatexForKatex(formulaData.content);
+    const content = prepareDisplayMathContent(formulaData.content);
+    if (!content) return "";
     const isBlock = formulaData.isBlock || requiresDisplayMath(content);
     try {
-      const rendered = katex.renderToString(content, {
-        throwOnError: false,
-        displayMode: isBlock,
-        output: "html",
-        trust: true,
-        strict: false,
-      });
-
+      const rendered = renderKatexHtml(content, isBlock);
       if (isBlock) {
         return `<div class="katex-scroll-container">${rendered}</div>`;
       }
@@ -406,6 +480,7 @@ type HtmlElementMatch = {
 type IndexedFollowUpChatPair = {
   pair: FollowUpChatPair;
   index: number;
+  hasRawContent: boolean;
 };
 
 function findMatchingElementEnd(
@@ -498,7 +573,14 @@ function inferFollowUpChatRole(
     return explicitRole;
   }
 
-  const style = readHtmlAttribute(openingTag, "style").toLowerCase();
+  // CSS serialization can turn hex colors into rgb() after a note is edited.
+  const style = readHtmlAttribute(openingTag, "style")
+    .toLowerCase()
+    .replace(
+      /rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/g,
+      (_match, r: string, g: string, b: string) =>
+        `#${[r, g, b].map((value) => Number(value).toString(16).padStart(2, "0")).join("")}`,
+    );
   if (style.includes("#4f8fd9") || style.includes("#e3f2fd")) {
     return "user";
   }
@@ -512,7 +594,8 @@ function parsePairFromVisibleElement(
   element: HtmlElementMatch,
 ): FollowUpChatPair | null {
   const encodedPair = decodePairFromDataAttribute(element.openingTag);
-  if (encodedPair) return encodedPair;
+  if (encodedPair?.user.trim() && encodedPair.assistant.trim())
+    return encodedPair;
 
   const pairId =
     readHtmlAttribute(element.openingTag, "data-ai-butler-chat-pair-id") ||
@@ -521,11 +604,15 @@ function parsePairFromVisibleElement(
 
   let user = "";
   let assistant = "";
+  let roleEndIndex = -1;
   for (const roleElement of findElementsByOpeningTag(
     element.innerHtml,
     (openingTag, tagName) =>
       tagName === "div" && !!inferFollowUpChatRole(openingTag),
   )) {
+    // A styled code block inside an answer is content, not another message.
+    if (roleElement.startIndex < roleEndIndex) continue;
+    roleEndIndex = roleElement.endIndex;
     const role = inferFollowUpChatRole(roleElement.openingTag);
     const text = htmlToPlainText(
       roleElement.innerHtml.replace(/<strong\b[^>]*>[\s\S]*?<\/strong>/i, ""),
@@ -537,8 +624,10 @@ function parsePairFromVisibleElement(
     }
   }
 
+  user = encodedPair?.user.trim() ? encodedPair.user : user;
+  assistant = encodedPair?.assistant.trim() ? encodedPair.assistant : assistant;
   if (!user && !assistant) return null;
-  return { id: pairId, user, assistant };
+  return { id: encodedPair?.id || pairId, user, assistant };
 }
 
 function findVisibleFollowUpChatPairs(html: string): IndexedFollowUpChatPair[] {
@@ -548,6 +637,7 @@ function findVisibleFollowUpChatPairs(html: string): IndexedFollowUpChatPair[] {
     .map((element) => ({
       pair: parsePairFromVisibleElement(element),
       index: element.startIndex,
+      hasRawContent: !!decodePairFromDataAttribute(element.openingTag),
     }))
     .filter(
       (item): item is IndexedFollowUpChatPair =>
@@ -559,12 +649,12 @@ export function parseFollowUpChatPairsFromNoteHtml(
   html: string,
 ): FollowUpChatPair[] {
   const pairs: FollowUpChatPair[] = [];
-  const seenIds = new Set<string>();
+  const seenPairs = new Map<string, IndexedFollowUpChatPair>();
   const candidates: IndexedFollowUpChatPair[] = [];
   const pushCandidate = (raw: unknown, index: number) => {
     const parsed = normalizeFollowUpChatPair(raw);
     if (!parsed) return;
-    candidates.push({ pair: parsed, index });
+    candidates.push({ pair: parsed, index, hasRawContent: true });
   };
   const markerPattern = /<!--\s*AI_BUTLER_CHAT_JSON:\s*([\s\S]*?)\s*-->/g;
   let match: RegExpExecArray | null;
@@ -580,9 +670,24 @@ export function parseFollowUpChatPairsFromNoteHtml(
   candidates.push(...findVisibleFollowUpChatPairs(html));
   candidates.sort((a, b) => a.index - b.index);
 
-  for (const { pair } of candidates) {
-    if (seenIds.has(pair.id)) continue;
-    seenIds.add(pair.id);
+  for (const candidate of candidates) {
+    const { pair } = candidate;
+    const existing = seenPairs.get(pair.id);
+    if (existing) {
+      // Prefer original Markdown, but recover missing fields from visible HTML.
+      for (const role of ["user", "assistant"] as const) {
+        if (
+          pair[role].trim() &&
+          (!existing.pair[role].trim() ||
+            (candidate.hasRawContent && !existing.hasRawContent))
+        ) {
+          existing.pair[role] = pair[role];
+        }
+      }
+      existing.hasRawContent ||= candidate.hasRawContent;
+      continue;
+    }
+    seenPairs.set(pair.id, candidate);
     pairs.push(pair);
   }
 
