@@ -11,7 +11,7 @@ export default defineConfig({
   namespace: pkg.config.addonRef,
   updateURL: `https://github.com/{{owner}}/{{repo}}/releases/download/release/{{updateJson}}`,
   xpiDownloadLink:
-    "https://github.com/{{owner}}/{{repo}}/releases/download/Fang_v{{version}}/{{xpiName}}.xpi",
+    "https://github.com/{{owner}}/{{repo}}/releases/download/Fang_v{{version}}/zotero-ai-butler-fang.xpi",
 
   release: {
     bumpp: {

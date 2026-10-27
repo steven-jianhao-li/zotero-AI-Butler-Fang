@@ -23,12 +23,14 @@ After every sync or release, verify these Fang-specific settings:
 - `zotero-plugin.config.ts` contains:
   - `xpiName: "方班论文阅读神器"`
   - release tag template `Fang_v%s`
-  - XPI download URL path `Fang_v{{version}}/{{xpiName}}.xpi`
+  - XPI download URL path `Fang_v{{version}}/zotero-ai-butler-fang.xpi`
 - `.github/workflows/release.yml` triggers only `Fang_v*` tags, not `v*` tags.
 - `scripts/release.mjs` exists and removes non-`Fang_v` local tags before release.
 - Built XPI is `.scaffold/build/方班论文阅读神器.xpi`.
-- Built update link points to `/releases/download/Fang_v<version>/方班论文阅读神器.xpi`.
+- Built update link points to `/releases/download/Fang_v<version>/zotero-ai-butler-fang.xpi`.
+- CI copies the Chinese-named build to `.scaffold/release/zotero-ai-butler-fang.xpi` for upload; the published asset name and update link must match.
 - `src/defaults/prompts/deep-read.json` template name is `方班深度精读`.
+- Preserve Fang PNG icons when upstream refreshes its branding. New UI surfaces such as the Agent should use the Fang `logo.png`.
 
 ## Sync Upstream
 
@@ -71,7 +73,9 @@ npm run release
 - Choose `patch`, `minor`, or `major` for official releases.
 - Do not use `-fang` in `package.json` versions; SemVer treats that as prerelease.
 - Fang identity is represented by GitHub tag names like `Fang_v4.1.5`, the private repo, branding, prompts, and update URLs.
-- CI uploads the actual built XPI using `.scaffold/build/*.xpi`; this avoids `default.xpi` naming regressions.
+- CI uploads an identical copy of the built XPI under the stable ASCII filename `zotero-ai-butler-fang.xpi`. GitHub sanitizes non-ASCII asset filenames, so uploading the Chinese filename directly can produce `default.xpi` and break updates.
+- If the sync already set `package.json` to the requested version, the release CLI skips tagging that same version. After validation and committing, create `Fang_v<version>` explicitly and push only `dev` and that tag to `origin`.
+- Verify the release workflow succeeds, the uploaded XPI has the expected version and hash, and the published update manifest points to that exact asset.
 
 ## Tag Hygiene
 
@@ -115,7 +119,7 @@ The `release` tag in origin is allowed; it hosts `update.json` and must not trig
 
 ## Common Diagnostics
 
-- GitHub Release asset named `default.xpi`: CI upload path did not use built XPI directly. Ensure workflow uses `softprops/action-gh-release` with `.scaffold/build/*.xpi`.
+- GitHub Release asset named `default.xpi`: GitHub can sanitize a Chinese-only filename to `default.xpi`. Preserve the local Chinese XPI, upload its ASCII-named copy, and keep `xpiDownloadLink` aligned with the published asset name.
 - Release workflow runs for `v4.x` or beta tags: Fang origin contains public `v*` tags, or workflow listens to `v*`. Delete those tags and keep only `Fang_v*` in workflow triggers.
 - `npm run release` reports missing `package.json`: command was run from the parent workspace, not the Fang repo root.
 - VSCode “Sync changes” can refer to a different opened repository. Confirm repository name and run `git rev-list --left-right --count HEAD...origin/dev` before clicking.
