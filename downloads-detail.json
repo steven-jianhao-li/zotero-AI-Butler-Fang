@@ -1,0 +1,91 @@
+{
+  "repository": "steven-jianhao-li/zotero-AI-Butler-Fang",
+  "updatedAt": "2026-10-27T14:48:54.695Z",
+  "totalDownloads": 10,
+  "releaseCount": 8,
+  "assetCount": 7,
+  "releases": [
+    {
+      "tag": "Fang_v5.1.1",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 681893424,
+          "name": "zotero-ai-butler-fang.xpi",
+          "downloads": 0
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.2.0",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 499692957,
+          "name": "default.xpi",
+          "downloads": 6
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.1.6",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 458625440,
+          "name": "default.xpi",
+          "downloads": 2
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.1.5",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 458601659,
+          "name": "default.xpi",
+          "downloads": 2
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.1.4",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 458595847,
+          "name": "default.xpi",
+          "downloads": 0
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.1.3",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 458577389,
+          "name": "default.xpi",
+          "downloads": 0
+        }
+      ]
+    },
+    {
+      "tag": "Fang_v4.1.2",
+      "prerelease": false,
+      "assets": [
+        {
+          "id": 458529928,
+          "name": "default.xpi",
+          "downloads": 0
+        }
+      ]
+    },
+    {
+      "tag": "release",
+      "prerelease": true,
+      "assets": []
+    }
+  ]
+}
