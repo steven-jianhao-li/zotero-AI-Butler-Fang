@@ -1,7 +1,7 @@
 {
   "repository": "steven-jianhao-li/zotero-AI-Butler-Fang",
-  "updatedAt": "2026-11-21T19:27:32.955Z",
-  "totalDownloads": 44,
+  "updatedAt": "2026-11-22T07:04:19.334Z",
+  "totalDownloads": 45,
   "releaseCount": 8,
   "assetCount": 7,
   "releases": [
@@ -12,7 +12,7 @@
         {
           "id": 681893424,
           "name": "zotero-ai-butler-fang.xpi",
-          "downloads": 34
+          "downloads": 35
         }
       ]
     },
